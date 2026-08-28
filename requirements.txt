@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+psycopg[binary]==3.2.3
+openai==1.59.7
+python-dotenv==1.0.1
+python-multipart==0.0.20
+pypdf==5.1.0
+pdfplumber==0.11.5
+markdown==3.7
+bleach==6.2.0
+tree-sitter==0.25.2
+tree-sitter-python==0.25.0
+tree-sitter-go==0.25.0

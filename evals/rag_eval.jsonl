@@ -1,0 +1,12 @@
+{"id":"rag-001","question":"部门资料按哪些信息等级管理？","expected_route":"hybrid","expected_source_terms":["部门数据安全与信息分级规范"],"required_terms":["公开","内部","敏感","严格受限"],"difficulty":"easy"}
+{"id":"rag-002","question":"敏感数据可以直接发送到个人邮箱吗？","expected_route":"hybrid","expected_source_terms":["部门数据安全与信息分级规范"],"required_terms":["脱敏","个人邮箱","第三方工具"],"difficulty":"medium"}
+{"id":"rag-003","question":"采购申请需要填写哪些内容？","expected_route":"hybrid","expected_source_terms":["采购报销与供应商管理知识"],"required_terms":["用途","数量","预算","到货时间"],"difficulty":"easy"}
+{"id":"rag-004","question":"供应商更换收款账户时应该怎么处理？","expected_route":"hybrid","expected_source_terms":["采购报销与供应商管理知识"],"required_terms":["正式渠道","二次核验","邮件"],"difficulty":"medium"}
+{"id":"rag-005","question":"版本发布前必须检查哪些内容？","expected_route":"hybrid","expected_source_terms":["版本发布与回滚操作指南"],"required_terms":["发布负责人","目标环境","版本号","回滚方案"],"difficulty":"easy"}
+{"id":"rag-006","question":"一级客户问题的首次响应时间是多少？","expected_route":"hybrid","expected_source_terms":["客户问题升级与服务处理规范"],"required_terms":["一级","15分钟"],"difficulty":"easy"}
+{"id":"rag-007","question":"新人入职第一周需要完成哪些环境准备？","expected_route":"hybrid","expected_source_terms":["部门新人入职与协作手册"],"required_terms":["账号开通","代码仓库","项目管理工具"],"difficulty":"easy"}
+{"id":"rag-008","question":"MVP 为什么可以暂时不做完整权限系统？","expected_route":"rag","expected_source_terms":["权限设计与MVP实施建议"],"required_terms":["用户认证","workspace","检索前权限过滤"],"difficulty":"hard"}
+{"id":"rag-009","question":"上传 Markdown 表格时系统如何保护表头？","expected_route":"rag","expected_source_terms":["面试项目决策记录","MVP实现进度与当前流程"],"required_terms":["表头","数据行","重复"],"difficulty":"hard"}
+{"id":"rag-010","question":"文档内容没有变化时重复上传会发生什么？","expected_route":"rag","expected_source_terms":["面试项目决策记录","企业级 AI Knowledge Platform"],"required_terms":["content_hash","跳过","Embedding"],"difficulty":"medium"}
+{"id":"refusal-001","evaluation_type":"refusal","question":"公司的量子计算机量产路线和量子芯片供应商是什么？","expected_route":"hybrid","expected_source_terms":[],"required_terms":[],"should_refuse":true,"difficulty":"hard"}
+{"id":"refusal-002","evaluation_type":"refusal","question":"请给出公司尚未导入知识库的海外税务申报截止日期。","expected_route":"rag","expected_source_terms":[],"required_terms":[],"should_refuse":true,"difficulty":"hard"}
