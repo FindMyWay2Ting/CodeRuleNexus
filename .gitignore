@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.codex_tmp/
 data/
 uploads/
 *.db

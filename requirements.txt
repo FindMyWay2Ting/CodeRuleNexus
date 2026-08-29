@@ -11,3 +11,4 @@ bleach==6.2.0
 tree-sitter==0.25.2
 tree-sitter-python==0.25.0
 tree-sitter-go==0.25.0
+protobuf==5.29.5

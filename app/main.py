@@ -1,5 +1,9 @@
 from pathlib import Path
 import asyncio
+import re
+import shutil
+import tempfile
+import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -12,10 +16,16 @@ from pydantic import BaseModel
 
 from .config import settings
 from .code_wiki import (
+    DEFAULT_REPOSITORY_ROOT,
+    IGNORED_DIRS,
     get_code_overview,
     get_code_symbol,
+    import_github_repository,
     initialize_code_wiki,
+    list_code_files,
     list_code_projects,
+    managed_local_repository_path,
+    normalize_uploaded_path,
     persist_scan,
     scan_project,
     search_code_symbols,
@@ -72,6 +82,10 @@ class ChatRequest(BaseModel):
 
 class PathRequest(BaseModel):
     path: str
+
+
+class GithubRepositoryRequest(BaseModel):
+    repository_url: str
 
 
 class InvalidateRequest(BaseModel):
@@ -224,7 +238,7 @@ def scan_local(request: PathRequest) -> dict:
 
 @app.post("/api/code-wiki/scan")
 def scan_code_project(request: PathRequest) -> dict:
-    """扫描本地项目并写入代码事实层；当前不调用 LLM，也不生成推测性 Wiki。"""
+    """扫描本地项目；Tree-sitter 建立结构，Go SCIP 可选增强语义，全程不调用 LLM。"""
     root = Path(request.path).expanduser()
     if not root.is_dir():
         raise HTTPException(404, "project path does not exist or is not a directory")
@@ -234,6 +248,125 @@ def scan_code_project(request: PathRequest) -> dict:
         logger.exception("code_wiki_scan_failed path=%s", root)
         raise HTTPException(500, f"code wiki scan failed: {exc}") from exc
     return {"status": "ok", **result}
+
+
+@app.post("/api/code-wiki/import/github")
+def import_github_code_project(request: GithubRepositoryRequest) -> dict:
+    """拉取公开 GitHub 仓库并复用本地 Code Wiki 扫描链路。"""
+    try:
+        imported = import_github_repository(request.repository_url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    try:
+        scan = scan_project(imported["path"])
+        scan["source"] = {
+            "type": "github",
+            "repository_url": imported["repository_url"],
+            "owner": imported["owner"],
+            "repository": imported["repository"],
+        }
+        result = persist_scan(scan)
+    except Exception as exc:
+        logger.exception("code_wiki_github_scan_failed repository=%s", imported["repository_url"])
+        raise HTTPException(500, f"GitHub 仓库已拉取，但代码扫描失败：{exc}") from exc
+    return {"status": "ok", "import_action": imported["action"], **result}
+
+
+@app.post("/api/code-wiki/import/local")
+async def import_local_code_project(files: list[UploadFile] = File(...)) -> dict:
+    """接收浏览器选择的完整项目目录，保存托管副本后建立 Code Wiki 索引。"""
+    max_files = 10_000
+    max_file_bytes = 20 * 1024 * 1024
+    max_total_bytes = 300 * 1024 * 1024
+    if not files or len(files) > max_files:
+        raise HTTPException(422, f"请选择项目目录，文件总数不能超过 {max_files} 个")
+
+    managed_root = (DEFAULT_REPOSITORY_ROOT / "local").resolve()
+    managed_root.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=".upload-", dir=managed_root))
+    staging_project = staging_root / "repository"
+    staging_project.mkdir()
+    project_name: str | None = None
+    total_bytes = 0
+    saved_files = 0
+    seen_paths: set[str] = set()
+
+    try:
+        for upload in files:
+            current_project, relative_path = normalize_uploaded_path(upload.filename or "")
+            if project_name is None:
+                project_name = current_project
+            elif current_project != project_name:
+                raise ValueError("一次只能上传一个项目目录")
+            if any(part.lower() in IGNORED_DIRS for part in relative_path.parts):
+                continue
+            relative_key = relative_path.as_posix()
+            if relative_key in seen_paths:
+                raise ValueError(f"项目中存在重复路径：{relative_key}")
+            seen_paths.add(relative_key)
+            target_file = staging_project.joinpath(*relative_path.parts)
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            file_bytes = 0
+            with target_file.open("wb") as output:
+                while chunk := await upload.read(1024 * 1024):
+                    file_bytes += len(chunk)
+                    total_bytes += len(chunk)
+                    if file_bytes > max_file_bytes:
+                        raise ValueError(f"单个文件不能超过 20 MB：{relative_key}")
+                    if total_bytes > max_total_bytes:
+                        raise ValueError("项目上传总大小不能超过 300 MB")
+                    output.write(chunk)
+            saved_files += 1
+
+        if not project_name or saved_files == 0:
+            raise ValueError("所选目录没有可扫描文件")
+
+        target = managed_local_repository_path(project_name, DEFAULT_REPOSITORY_ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
+        existed = target.exists()
+        installed = False
+        try:
+            if existed:
+                target.replace(backup)
+            staging_project.replace(target)
+            installed = True
+            scan = scan_project(str(target))
+            scan["project_name"] = project_name
+            scan["source"] = {
+                "type": "local_upload",
+                "project_name": project_name,
+                "uploaded_files": saved_files,
+            }
+            result = persist_scan(scan)
+        except Exception:
+            if installed and target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            if backup.exists():
+                backup.replace(target)
+            raise
+        else:
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+        return {
+            "status": "ok",
+            "import_action": "updated" if existed else "uploaded",
+            "uploaded_files": saved_files,
+            **result,
+        }
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("code_wiki_local_upload_failed project=%s", project_name or "unknown")
+        raise HTTPException(500, f"本地项目上传或扫描失败：{exc}") from exc
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        for upload in files:
+            await upload.close()
 
 
 @app.get("/api/code-wiki/projects")
@@ -252,20 +385,35 @@ def code_project_overview(project_id: str) -> dict:
     return result
 
 
+@app.get("/api/code-wiki/projects/{project_id}/files")
+def code_project_files(project_id: str) -> dict:
+    """返回项目当前 Commit 的文件、语言、行数、符号数和关系数。"""
+    normalized_id = parse_document_id(project_id)
+    return {"items": list_code_files(normalized_id)}
+
+
 @app.get("/api/code-wiki/symbols")
 def code_symbol_search(
     project_id: str = Query(...),
-    q: str = Query(..., min_length=1),
-    limit: int = Query(20, ge=1, le=100),
+    q: str = Query(default=""),
+    file_path: str | None = Query(default=None),
+    symbol_kind: str | None = Query(default=None),
+    limit: int = Query(100, ge=1, le=500),
 ) -> dict:
-    """按名称、限定名或文件路径搜索代码符号。"""
+    """搜索当前 Commit 的符号，也可按文件和符号类型筛选。"""
     normalized_id = parse_document_id(project_id)
-    return {"items": search_code_symbols(normalized_id, q.strip(), limit)}
+    return {"items": search_code_symbols(
+        normalized_id,
+        q.strip(),
+        limit,
+        file_path.strip() if file_path else None,
+        symbol_kind.strip() if symbol_kind else None,
+    )}
 
 
 @app.get("/api/code-wiki/symbols/{symbol_id}")
 def code_symbol_detail(symbol_id: str) -> dict:
-    """返回符号定位及其 imports/calls 关系，后续直接作为 Wiki Agent 工具。"""
+    """返回符号定位、出站关系以及引用/实现该符号的入站关系。"""
     normalized_id = parse_document_id(symbol_id)
     result = get_code_symbol(normalized_id)
     if not result:
