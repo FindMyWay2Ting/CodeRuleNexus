@@ -5,9 +5,9 @@
 1. 接收本地项目，或将公开 GitHub 仓库拉取到受控目录后扫描。
 2. 扫描项目文件并记录项目、Commit、文件和内容哈希。
 3. Python/Go 使用 Tree-sitter 提取结构，Python 在 grammar 缺失时回退到标准库 AST。
-4. Go module 使用 SCIP 补充精确定义、引用和实现关系，失败时保留结构扫描结果。
+4. Go module 使用本机 SCIP，Python 项目使用 Docker 中的 SCIP 补充精确定义、引用和实现关系，失败时保留结构扫描结果。
 5. 其他语言使用保守的定义边界回退，保证扫描链路可以先跑起来。
-6. 从依赖文件、初始化代码和配置文件中识别组件，并保存证据。
+6. 从依赖、初始化代码和配置中识别组件、模块、入口、API、资源和下游，并保存证据。
 7. 将结果写入独立的 Code Wiki 表，和 RAG 的 knowledge_chunks 分开。
 
 Tree-sitter 已作为 Python/Go 的实际解析主路径；SCIP indexer 作为精确语义索引增强路径，通过扫描结果报告可用性，避免外部构建环境阻塞基础事实扫描。
@@ -16,20 +16,43 @@ Tree-sitter 已作为 Python/Go 的实际解析主路径；SCIP indexer 作为�
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+import psycopg
+
 from .db import connection
+from .config import settings
 from . import scip_pb2
+from .config_parsers import parse_project_configs
+
+logger = logging.getLogger("knowledge.code_wiki")
+
+
+class RepositoryImportBusy(RuntimeError):
+    """同一工作空间中的同一远程仓库已有导入任务。"""
+
+
+class CodeImportValidationError(ValueError):
+    """可以安全返回给客户端的代码导入参数错误。"""
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - requirements 已声明，保留旧环境降级能力
+    yaml = None
 
 try:
     # grammar 包独立发布，缺包时仍允许旧环境使用 AST/正则回退。
@@ -66,7 +89,7 @@ DEFAULT_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent / "data" / "cod
 # 但不单独生成数据库符号，避免大型项目被参数和临时变量淹没。
 SCIP_WIKI_KINDS = {
     "class", "constructor", "enum", "field", "function", "interface", "method",
-    "module", "namespace", "package", "struct", "trait", "type", "typealias",
+    "module", "namespace", "package", "struct", "trait", "type", "typealias", "symbol",
 }
 
 
@@ -109,12 +132,96 @@ class FileFact:
     relations: list[RelationFact] = field(default_factory=list)
 
 
+@dataclass
+class ArchitectureFact:
+    """架构理解层的一条确定性事实，必须可以回溯到文件和代码行。"""
+
+    fact_type: str
+    name: str
+    value: str | None
+    path: str
+    line: int
+    evidence: str
+    confidence: float = 1.0
+
+
+@dataclass
+class ArchitectureLink:
+    """连接配置、客户端初始化和实际使用点的可解释架构边。"""
+
+    source_fact_key: tuple[str, str, str | None, str, int]
+    target_fact_key: tuple[str, str, str | None, str, int]
+    relation_type: str
+    evidence: str
+    confidence: float = 1.0
+
+
+def _architecture_fact_key(fact: ArchitectureFact) -> tuple[str, str, str | None, str, int]:
+    """架构事实的扫描期稳定键，与数据库唯一约束字段保持一致。"""
+    return (fact.fact_type, fact.name, fact.value, fact.path, fact.line)
+
+
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _hash_file_bytes(path: Path) -> str:
+    """流式计算大文件哈希，避免为生成内容版本一次读入整个文件。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _safe_architecture_value(value: str) -> str:
+    """脱敏密码、Token 和连接串凭据，只保留架构识别需要的名称与地址。"""
+    clean = value.strip().strip("\"'`")
+    clean = re.sub(
+        r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*([^;,&\s]+)",
+        r"\1=[REDACTED]",
+        clean,
+    )
+    clean = re.sub(r"(?i)(://[^:/\s]+:)[^@/\s]+@", r"\1[REDACTED]@", clean)
+    clean = re.sub(r"(?i)([?&](?:token|key|signature|sig|credential)=)[^&#\s]+", r"\1[REDACTED]", clean)
+    return clean[:177] + "..." if len(clean) > 180 else clean
+
+
+def _line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _yaml_scalar_entries(text: str) -> list[tuple[str, str, int, str]]:
+    """读取 YAML 标量并保留完整键路径与行号；解析失败时由普通行规则继续兜底。"""
+    if yaml is None:
+        return []
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return []
+    entries: list[tuple[str, str, int, str]] = []
+
+    def walk(node, path: list[str]) -> None:
+        if isinstance(node, yaml.MappingNode):
+            for key_node, value_node in node.value:
+                key = str(getattr(key_node, "value", ""))
+                walk(value_node, [*path, key])
+        elif isinstance(node, yaml.SequenceNode):
+            for value_node in node.value:
+                walk(value_node, path)
+        elif isinstance(node, yaml.ScalarNode) and path:
+            line = node.start_mark.line + 1
+            value = str(node.value)
+            full_key = ".".join(path)
+            entries.append((full_key, value, line, f"{full_key}: {value}"))
+
+    if root is not None:
+        walk(root, [])
+    return entries
 
 
 def _git_commit(root: Path) -> tuple[str, str]:
@@ -144,10 +251,10 @@ def normalize_github_url(repository_url: str) -> tuple[str, str, str]:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("请输入标准 GitHub HTTPS 地址，例如 https://github.com/owner/repository")
+        raise CodeImportValidationError("请输入标准 GitHub HTTPS 地址，例如 https://github.com/owner/repository")
     parts = [part for part in parsed.path.strip("/").split("/") if part]
     if len(parts) != 2:
-        raise ValueError("GitHub 地址必须指向一个仓库，不能是用户页、文件页或分支页")
+        raise CodeImportValidationError("GitHub 地址必须指向一个仓库，不能是用户页、文件页或分支页")
     owner, repository = parts
     if repository.lower().endswith(".git"):
         repository = repository[:-4]
@@ -156,8 +263,13 @@ def normalize_github_url(repository_url: str) -> tuple[str, str, str]:
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", repository)
         or repository in {".", ".."}
     ):
-        raise ValueError("GitHub owner 或仓库名称格式不正确")
+        raise CodeImportValidationError("GitHub owner 或仓库名称格式不正确")
     return f"https://github.com/{owner}/{repository}.git", owner, repository
+
+
+def github_repository_key(owner: str, repository: str) -> str:
+    """生成 GitHub 仓库的大小写无关身份键。"""
+    return f"{owner.casefold()}__{repository.casefold()}"
 
 
 def normalize_uploaded_path(filename: str) -> tuple[str, PurePosixPath]:
@@ -166,21 +278,40 @@ def normalize_uploaded_path(filename: str) -> tuple[str, PurePosixPath]:
     path = PurePosixPath(raw)
     parts = path.parts
     if path.is_absolute() or len(parts) < 2 or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError("本地项目文件必须包含文件夹相对路径，请重新选择整个项目目录")
+        raise CodeImportValidationError("本地项目文件必须包含文件夹相对路径，请重新选择整个项目目录")
     if any(re.search(r'[<>:"|?*\x00-\x1f]', part) for part in parts):
-        raise ValueError("本地项目中包含 Windows 不支持的文件名")
+        raise CodeImportValidationError("本地项目中包含 Windows 不支持的文件名")
     project_name = parts[0]
     if len(project_name) > 100:
-        raise ValueError("本地项目文件夹名称不能超过 100 个字符")
+        raise CodeImportValidationError("本地项目文件夹名称不能超过 100 个字符")
     return project_name, PurePosixPath(*parts[1:])
 
 
-def managed_local_repository_path(project_name: str, repository_root: Path | None = None) -> Path:
+def managed_local_repository_path(project_name: str, repository_root: Path | None = None, workspace_id: str | None = None) -> Path:
     """为浏览器上传项目生成稳定托管目录；同名文件夹会更新同一个项目。"""
     root = (repository_root or DEFAULT_REPOSITORY_ROOT).resolve() / "local"
+    if workspace_id and workspace_id != settings.workspace_id:
+        root = root / workspace_id
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", project_name).strip("-.")[:48] or "project"
     digest = _hash_text(project_name)[:8]
     return root / f"{slug}-{digest}"
+
+
+def managed_code_project_id(identity_path: Path, workspace_id: str) -> str:
+    """由稳定托管身份生成项目 ID；随机 staging 和 Commit 目录都不参与。"""
+    identity = str(identity_path.resolve())
+    if workspace_id != settings.workspace_id:
+        identity = f"{workspace_id}:{identity}"
+    return str(uuid.uuid5(ID_NAMESPACE, identity))
+
+
+def _remove_managed_tree(path: Path) -> None:
+    """删除系统托管目录，并处理 Git pack 文件在 Windows 上的只读属性。"""
+    def remove_readonly(func, filename, _exc_info):
+        os.chmod(filename, stat.S_IWRITE)
+        func(filename)
+
+    shutil.rmtree(path, onerror=remove_readonly)
 
 
 def _run_git(command: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -191,7 +322,11 @@ def _run_git(command: list[str], timeout: int = 120) -> subprocess.CompletedProc
         return subprocess.run(
             command,
             capture_output=True,
+            # Windows 默认代码页可能无法解码 Git 输出中的中文路径，导致
+            # subprocess reader 线程异常并返回 stdout=None；统一用 UTF-8 容错。
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=True,
             env=environment,
@@ -205,46 +340,9 @@ def _run_git(command: list[str], timeout: int = 120) -> subprocess.CompletedProc
         raise RuntimeError(f"GitHub 仓库拉取失败：{detail}") from exc
 
 
-def import_github_repository(repository_url: str, repository_root: Path | None = None) -> dict:
-    """将公开 GitHub 仓库克隆到托管目录；已有仓库仅允许 fast-forward 更新。"""
-    canonical_url, owner, repository = normalize_github_url(repository_url)
-    managed_root = (repository_root or DEFAULT_REPOSITORY_ROOT).resolve()
-    managed_root.mkdir(parents=True, exist_ok=True)
-    target = managed_root / f"{owner}__{repository}"
-
-    if target.exists():
-        if not (target / ".git").is_dir():
-            raise RuntimeError(f"托管目录已存在但不是 Git 仓库：{target}")
-        remote = _run_git(["git", "-C", str(target), "remote", "get-url", "origin"], timeout=10)
-        try:
-            existing_url = normalize_github_url(remote.stdout.strip())[0]
-        except ValueError as exc:
-            raise RuntimeError("已有托管仓库的 origin 不是受支持的 GitHub HTTPS 地址") from exc
-        if existing_url.lower() != canonical_url.lower():
-            raise RuntimeError("托管目录对应另一个远程仓库，已停止更新")
-        _run_git(["git", "-C", str(target), "pull", "--ff-only", "--depth", "1"])
-        action = "updated"
-    else:
-        temporary_root = Path(tempfile.mkdtemp(prefix=".clone-", dir=managed_root))
-        temporary_target = temporary_root / "repository"
-        try:
-            _run_git(["git", "clone", "--depth", "1", canonical_url, str(temporary_target)])
-            os.replace(temporary_target, target)
-        finally:
-            shutil.rmtree(temporary_root, ignore_errors=True)
-        action = "cloned"
-
-    return {
-        "path": str(target.resolve()),
-        "repository_url": canonical_url.removesuffix(".git"),
-        "owner": owner,
-        "repository": repository,
-        "action": action,
-    }
-
-
+@lru_cache(maxsize=1)
 def _scip_indexer_status() -> dict:
-    """报告 SCIP CLI 是否真正可执行；不在普通扫描中生成索引，避免阻塞语法扫描。"""
+    """报告 SCIP CLI 是否真正可执行；索引器探测失败不能阻塞基础语法扫描。"""
 
     def probe(executable: str | None) -> str:
         """用版本命令做轻量冒烟测试，区分“文件存在”和“CLI 能启动”。"""
@@ -255,7 +353,7 @@ def _scip_indexer_status() -> dict:
                 [executable, "--version"],
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=3,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -281,8 +379,23 @@ def _scip_indexer_status() -> dict:
         python_status = "requires_node_20_lts"
     elif python_path and node_version and not node_version.startswith("v20."):
         python_status = "requires_node_20_lts"
+    docker_path = shutil.which("docker")
+    python_container_status = "not_installed"
+    if docker_path:
+        try:
+            image_result = subprocess.run(
+                [docker_path, "image", "inspect", settings.scip_python_image],
+                capture_output=True,
+                text=True,
+                    timeout=3,
+                check=False,
+            )
+            python_container_status = "ready" if image_result.returncode == 0 else "image_not_found"
+        except (OSError, subprocess.SubprocessError):
+            python_container_status = "unavailable"
     return {
         "python": {"available": bool(python_path), "executable": python_path, "node_version": node_version, "status": python_status},
+        "python_container": {"available": python_container_status == "ready", "executable": docker_path, "image": settings.scip_python_image, "status": python_container_status},
         "go": {"available": bool(go_path), "executable": go_path, "status": probe(go_path)},
     }
 
@@ -407,8 +520,9 @@ class _PythonExtractor(ast.NodeVisitor):
 def _extract_python(path: str, source: str) -> tuple[list[SymbolFact], list[RelationFact]]:
     try:
         tree = ast.parse(source, filename=path)
-    except SyntaxError as exc:
-        return _extract_generic(path, source, parse_error=str(exc))
+    except SyntaxError:
+        # 解析诊断可能包含源码片段和本机路径；事实层只记录稳定错误类型。
+        return _extract_generic(path, source, parse_error="python_syntax_error")
     extractor = _PythonExtractor(path, source)
     extractor.visit(tree)
     return extractor.symbols, extractor.relations
@@ -593,6 +707,9 @@ def _scip_symbol_name(info) -> str:
 
 
 def _scip_symbol_kind(info) -> str:
+    # 部分 SCIP 索引器（包括 scip-python）会把合法符号的 kind 写成
+    # Unspecified(0)，但 definition occurrence 和符号描述仍然完整；保留为
+    # 通用 symbol，避免因为枚举值缺省而丢掉整个语言的定义层。
     if not info or not info.kind:
         return "symbol"
     return scip_pb2.SymbolInformation.Kind.Name(info.kind).removesuffix("Kind").lower()
@@ -640,6 +757,10 @@ def _merge_scip_index(index_path: Path, module_root: Path, project_root: Path, f
             if not info or _scip_symbol_kind(info) not in SCIP_WIKI_KINDS:
                 continue
             name = _scip_symbol_name(info)
+            # scip-python 偶尔会为缺少有效 SymbolInformation 的定义生成 unknown；
+            # 这类节点既不能导航，又可能在同一位置重复出现，不写入 Wiki 事实层。
+            if name == "unknown":
+                continue
             occurrence_start, _ = _scip_lines(occurrence)
             start_line, end_line = _scip_lines(occurrence, enclosing=True)
             existing = next((
@@ -777,15 +898,82 @@ def _run_go_scip(root: Path, files: list[FileFact], indexers: dict) -> dict:
                 })
                 report["summary"]["succeeded"] += 1
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+                logger.warning(
+                    "go_scip_module_failed module=%s error_type=%s",
+                    module_root.relative_to(root).as_posix(), type(exc).__name__, exc_info=True,
+                )
                 report["modules"].append({
                     "module_root": module_root.relative_to(root).as_posix(),
                     "status": "failed",
-                    "error": str(exc),
+                    "error": "scip_go_execution_failed",
                 })
                 report["summary"]["failed"] += 1
     report["status"] = "succeeded" if not report["summary"]["failed"] else (
         "partial" if report["summary"]["succeeded"] else "failed"
     )
+    return report
+
+
+def _run_python_scip(root: Path, files: list[FileFact], indexers: dict) -> dict:
+    """在隔离 Linux 容器中运行 Python SCIP，并将 index.scip 合并到统一事实层。
+
+    源码目录只读挂载，输出目录单独读写挂载；容器使用 network none，避免索引阶段
+    访问外部网络。任何 Docker、依赖或 SCIP 错误都只影响语义增强，不丢失 Tree-sitter 结果。
+    """
+    python_files = [item for item in files if item.language == "python"]
+    report = {"status": "skipped", "reason": "no_python_files", "documents": 0, "definitions": 0, "references": 0, "relationships": 0}
+    if not python_files:
+        return report
+    # 没有项目级环境描述时不启动昂贵的语义索引；Tree-sitter 仍会提供结构事实。
+    environment_files = {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile", "poetry.lock"}
+    has_environment = any(
+        path.is_file()
+        and path.name in environment_files
+        and not any(part in IGNORED_DIRS for part in path.relative_to(root).parts)
+        for path in root.rglob("*")
+    )
+    if not has_environment:
+        report["reason"] = "no_python_environment_manifest"
+        return report
+    container_status = indexers.get("python_container", {})
+    docker_path = container_status.get("executable")
+    if container_status.get("status") != "ready" or not docker_path:
+        report.update(status="unavailable", reason=container_status.get("status", "docker_unavailable"))
+        return report
+
+    with tempfile.TemporaryDirectory(prefix="knowledge-python-scip-", dir=str(root.parent)) as output_dir:
+        output = Path(output_dir) / "index.scip"
+        # Docker Desktop 接受 Windows 主机路径；统一使用绝对路径，避免工作目录漂移。
+        command = [
+            docker_path, "run", "--rm", "--network", "none",
+            "--read-only", "--cpus", "2", "--memory", "2g",
+            # scip-python 会在 /tmp 创建临时虚拟环境探测目录；仅开放这块临时空间。
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
+            "-v", f"{root.resolve()}:/work:ro",
+            "-v", f"{Path(output_dir).resolve()}:/output:rw",
+            "--entrypoint", "scip-python", settings.scip_python_image,
+            "index", "--cwd", "/work", "--project-name", root.name,
+            "--output", "/output/index.scip",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=settings.scip_python_timeout,
+                check=False,
+            )
+            if result.returncode != 0 or not output.is_file():
+                detail = (result.stderr or result.stdout or "index file was not generated").strip()
+                raise RuntimeError(detail[-2000:])
+            stats = _merge_scip_index(output, root, root, files)
+            report.update(status="succeeded", reason=None, **stats)
+        except subprocess.TimeoutExpired:
+            report.update(status="failed", reason=f"timeout_{settings.scip_python_timeout}s")
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            # 第三方索引器 stderr 可能包含主机路径、环境变量或依赖细节，只写服务日志。
+            logger.warning("python_scip_failed error_type=%s", type(exc).__name__, exc_info=True)
+            report.update(status="failed", reason="python_scip_execution_failed")
     return report
 
 
@@ -836,22 +1024,473 @@ def _component_facts(root: Path, files: list[FileFact]) -> list[dict]:
     ]
 
 
-def scan_project(root_path: str) -> dict:
+def _architecture_facts(root: Path) -> list[ArchitectureFact]:
+    """提取模块、执行入口、API、组件和资源，结果只来自可定位的静态证据。"""
+    manifest_names = {
+        "requirements.txt", "pyproject.toml", "package.json", "pom.xml", "build.gradle",
+        "build.gradle.kts", "go.mod", "cargo.toml", "dockerfile", "compose.yml",
+        "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".env", ".env.example",
+    }
+    config_suffixes = {".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".conf", ".properties", ".proto"}
+    lockfile_names = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "go.sum", "poetry.lock", "cargo.lock"}
+    ignored = {item.lower() for item in IGNORED_DIRS}
+    architecture_ignored = ignored | {"test", "tests", "__tests__", "fixtures", "examples", "example"}
+    facts: dict[tuple[str, str, str | None, str, int], ArchitectureFact] = {}
+    declared_modules: set[tuple[str, str]] = set()
+    component_patterns = {
+        "Kafka": ("messaging", re.compile(r"(?im)((?:from|import)\s+[^\n]*kafka|kafka-python|confluent[-_]kafka|aiokafka|sarama|KafkaProducer|KafkaConsumer|^\s*KAFKA[A-Z0-9_.-]*\s*[:=])")),
+        "MongoDB": ("database", re.compile(r"(?im)((?:from|import)\s+[^\n]*(?:pymongo|motor|mongoengine)|go\.mongodb\.org|MongoClient|^\s*MONGO[A-Z0-9_.-]*\s*[:=])")),
+        "Redis": ("cache", re.compile(r"(?im)((?:from|import)\s+[^\n]*(?:redis|aioredis)|github\.com/redis|redis-py|Redis\s*\(|^\s*REDIS[A-Z0-9_.-]*\s*[:=])")),
+        "gRPC": ("rpc", re.compile(r"(?im)((?:from|import)\s+[^\n]*grpc|google\.golang\.org/grpc|grpcio|grpc\.(?:Dial|NewClient|NewServer)|grpc\.insecure_channel|^\s*GRPC[A-Z0-9_.-]*\s*[:=])")),
+        "HTTP client": ("downstream_transport", re.compile(r"(?i)(requests\.|httpx\.|aiohttp|resty\.New|axios\.|fetch\s*\()")),
+    }
+
+    def add(
+        fact_type: str,
+        name: str,
+        value: str | None,
+        path: str,
+        line: int,
+        evidence: str,
+        confidence: float = 0.9,
+    ) -> None:
+        safe_name = _safe_architecture_value(name)
+        safe_value = _safe_architecture_value(value) if value else None
+        safe_evidence = _safe_architecture_value(evidence)
+        key = (fact_type, safe_name, safe_value, path, line)
+        facts.setdefault(
+            key,
+            ArchitectureFact(fact_type, safe_name, safe_value, path, line, safe_evidence, confidence),
+        )
+
+    def downstream_name(key: str, value: str) -> str:
+        service_match = re.match(r"(?i)^(.+)_SERVICE_(?:BASE_)?(?:URL|URI|ENDPOINT|TARGET)$", key)
+        if service_match:
+            return service_match.group(1).lower().replace("_", "-") + "-service"
+        if "." in key:
+            segments = [segment for segment in re.split(r"[._-]+", key.lower()) if segment]
+            ignored_segments = {"url", "uri", "endpoint", "target", "base", "service", "services", "downstream", "client"}
+            for segment in reversed(segments):
+                if segment not in ignored_segments:
+                    return segment
+        stem = re.sub(r"(?i)(?:_BASE)?_(?:URL|URI|ENDPOINT|TARGET)$", "", key)
+        if stem and stem.lower() not in {"url", "uri", "endpoint", "target", "base", "baseurl", "serviceurl"}:
+            return stem.lower().replace("_", "-").replace(".", "-")
+        parsed = urlparse(value)
+        return parsed.hostname or value.split(":", 1)[0]
+
+    def add_module(name: str, module_kind: str, path: str, line: int, evidence: str) -> None:
+        """同一个逻辑模块只保留一条边界证据，避免每个源码文件重复展示。"""
+        key = (module_kind, name)
+        if key in declared_modules:
+            return
+        declared_modules.add(key)
+        add("module", name, module_kind, path, line, evidence, 0.95)
+
+    for path in sorted(root.rglob("*")):
+        relative_parts = path.relative_to(root).parts
+        if not path.is_file() or any(part.lower() in architecture_ignored for part in relative_parts):
+            continue
+        relative = path.relative_to(root).as_posix()
+        lower_name = path.name.lower()
+        if lower_name in lockfile_names:
+            continue
+        if (
+            lower_name.endswith(("_pb2.py", "_pb2_grpc.py", ".pb.go", ".gen.go", "_generated.go"))
+            or ".generated." in lower_name
+        ):
+            continue
+        if path.suffix.lower() not in set(CODE_EXTENSIONS) | config_suffixes and path.name.lower() not in manifest_names:
+            continue
+        if path.name == "code_wiki.py" and path.parent.name == "app":
+            continue
+        try:
+            if path.stat().st_size > 2 * 1024 * 1024:
+                continue
+            text = _read_text(path)
+        except OSError:
+            continue
+
+        # 模块边界优先使用语言原生声明。目录只是定位，不直接猜测业务职责。
+        if lower_name == "go.mod":
+            module_match = re.search(r"(?m)^\s*module\s+([^\s]+)", text)
+            if module_match:
+                add_module(module_match.group(1), "go_module", relative, _line_number(text, module_match.start()), module_match.group(0))
+        elif lower_name == "package.json":
+            try:
+                package_data = json.loads(text)
+            except json.JSONDecodeError:
+                package_data = {}
+            package_name = package_data.get("name") if isinstance(package_data, dict) else None
+            if isinstance(package_name, str) and package_name:
+                add_module(package_name, "javascript_package", relative, 1, f'package name: {package_name}')
+            scripts = package_data.get("scripts", {}) if isinstance(package_data, dict) else {}
+            if isinstance(scripts, dict):
+                for script_name in ("start", "dev", "serve"):
+                    command = scripts.get(script_name)
+                    if isinstance(command, str) and command:
+                        line = next((number for number, value in enumerate(text.splitlines(), 1) if f'"{script_name}"' in value), 1)
+                        add("entrypoint", script_name, command, relative, line, f'{script_name}: {command}', 0.9)
+
+        if path.suffix.lower() == ".py":
+            package_marker = path.parent / "__init__.py"
+            package_path = PurePosixPath(relative).parent
+            if package_path.parts and package_marker.is_file():
+                add_module(".".join(package_path.parts), "python_package", relative, 1, f"Python package: {package_path.as_posix()}")
+
+            # 将事实行定位在处理函数上，持久化时可以直接关联 source_symbol_id。
+            route_pattern = re.compile(
+                r"(?ms)^[ \t]*@(?P<router>[A-Za-z_][\w.]*)\.(?P<method>get|post|put|patch|delete|options|head|route)"
+                r"\(\s*[\"'](?P<route>[^\"']+)[\"'][^)]*\)\s*\n[ \t]*(?:async\s+)?def\s+(?P<handler>[A-Za-z_]\w*)"
+            )
+            for match in route_pattern.finditer(text):
+                method = match.group("method").upper()
+                method = "ROUTE" if method == "ROUTE" else method
+                handler_offset = match.start("handler")
+                add("http_api", match.group("handler"), f"{method} {match.group('route')}", relative,
+                    _line_number(text, handler_offset), match.group(0).splitlines()[0].strip(), 0.98)
+
+            task_pattern = re.compile(
+                r"(?ms)^[ \t]*@(?P<decorator>[A-Za-z_][\w.]*(?:task|scheduled_job|cron))\b[^\n]*\n"
+                r"[ \t]*(?:async\s+)?def\s+(?P<handler>[A-Za-z_]\w*)"
+            )
+            for match in task_pattern.finditer(text):
+                add("background_job", match.group("handler"), match.group("decorator"), relative,
+                    _line_number(text, match.start("handler")), match.group(0).splitlines()[0].strip(), 0.95)
+
+            lifecycle_pattern = re.compile(
+                r"(?ms)^[ \t]*@(?P<app>[A-Za-z_]\w*)\.on_event\(\s*[\"'](?P<event>startup|shutdown)[\"']\s*\)\s*\n"
+                r"[ \t]*(?:async\s+)?def\s+(?P<handler>[A-Za-z_]\w*)"
+            )
+            for match in lifecycle_pattern.finditer(text):
+                add("lifecycle_hook", match.group("handler"), match.group("event"), relative,
+                    _line_number(text, match.start("handler")), match.group(0).splitlines()[0].strip(), 0.98)
+
+            for match in re.finditer(r"(?m)^\s*(?P<name>[A-Za-z_]\w*)\s*=\s*(?P<framework>FastAPI|Flask)\s*\(", text):
+                add("entrypoint", match.group("name"), f"{match.group('framework')} application", relative,
+                    _line_number(text, match.start()), match.group(0).strip(), 0.98)
+            for match in re.finditer(r"(?m)^\s*if\s+__name__\s*==\s*[\"']__main__[\"']\s*:", text):
+                add("entrypoint", relative, "python_main", relative, _line_number(text, match.start()), match.group(0).strip(), 1.0)
+
+        elif path.suffix.lower() == ".go":
+            package_match = re.search(r"(?m)^\s*package\s+([A-Za-z_]\w*)", text)
+            package_name = package_match.group(1) if package_match else None
+            if package_match:
+                package_dir = PurePosixPath(relative).parent.as_posix()
+                add_module(package_dir if package_dir != "." else package_name, f"go_package:{package_name}", relative,
+                           _line_number(text, package_match.start()), package_match.group(0).strip())
+            if package_name == "main":
+                main_match = re.search(r"(?m)^\s*func\s+main\s*\(", text)
+                if main_match:
+                    add("entrypoint", "main", "go_main", relative, _line_number(text, main_match.start()), main_match.group(0).strip(), 1.0)
+
+            go_route_patterns = [
+                re.compile(r"(?m)\b[A-Za-z_]\w*\.(?P<method>GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Get|Post|Put|Patch|Delete)\(\s*[\"'](?P<route>[^\"']+)[\"']\s*,\s*(?P<handler>[A-Za-z_][\w.]*)"),
+                re.compile(r"(?m)\bhttp\.HandleFunc\(\s*[\"'](?P<route>[^\"']+)[\"']\s*,\s*(?P<handler>[A-Za-z_][\w.]*)"),
+            ]
+            for pattern in go_route_patterns:
+                for match in pattern.finditer(text):
+                    method = match.groupdict().get("method") or "ANY"
+                    route_label = f"{method.upper()} {match.group('route')}"
+                    handler = match.group("handler")
+                    # Go 匿名函数以 func 开头，它不是可跳转的符号名，改用路由标识展示。
+                    name = route_label if handler == "func" else handler
+                    value = "inline_handler" if handler == "func" else route_label
+                    add("http_api", name, value, relative,
+                        _line_number(text, match.start()), match.group(0).strip(), 0.95)
+
+        elif path.suffix.lower() == ".proto":
+            for service_match in re.finditer(r"(?m)^\s*service\s+([A-Za-z_]\w*)\s*\{", text):
+                service_name = service_match.group(1)
+                add("rpc_service", service_name, "grpc", relative, _line_number(text, service_match.start()), service_match.group(0).strip(), 1.0)
+            for rpc_match in re.finditer(r"(?m)^\s*rpc\s+([A-Za-z_]\w*)\s*\(\s*([^)]*)\)\s+returns\s+\(\s*([^)]*)\)", text):
+                add("rpc_method", rpc_match.group(1), f"{rpc_match.group(2)} -> {rpc_match.group(3)}", relative,
+                    _line_number(text, rpc_match.start()), rpc_match.group(0).strip(), 1.0)
+
+        detected_components: set[str] = set()
+        for name, (category, pattern) in component_patterns.items():
+            match = pattern.search(text)
+            if not match:
+                continue
+            detected_components.add(name)
+            confidence = 0.95 if path.name.lower() in manifest_names else 0.85
+            add("component", name, category, relative, _line_number(text, match.start()), match.group(0), confidence)
+
+        has_kafka = "Kafka" in detected_components
+        has_mongo = "MongoDB" in detected_components
+        is_config_file = path.suffix.lower() in config_suffixes or path.name.lower() in manifest_names
+        is_example_config = lower_name.endswith(".example") or ".example." in lower_name
+
+        def record_config(key: str, value: str, line: int, evidence: str) -> None:
+            lower_key = key.lower()
+            if re.search(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)", key) or is_example_config:
+                return
+            if has_kafka and "topic" in lower_key:
+                add("kafka_topic_config", value, value, relative, line, evidence, 0.95)
+            elif has_kafka and ("group" in lower_key or "consumer" in lower_key):
+                add("kafka_consumer_group", value, value, relative, line, evidence, 0.9)
+            elif has_kafka and any(term in lower_key for term in ("broker", "bootstrap", "kafka_url")):
+                add("kafka_cluster", key, value, relative, line, evidence, 0.9)
+            if has_mongo and "collection" in lower_key:
+                add("mongo_collection", value, value, relative, line, evidence, 0.95)
+            elif has_mongo and (lower_key.endswith("database") or lower_key.endswith("db") or "mongo_db" in lower_key):
+                add("mongo_database", value, value, relative, line, evidence, 0.9)
+            elif has_mongo and any(term in lower_key for term in ("mongo_url", "mongo_uri", "mongodb_url", "mongodb_uri")):
+                add("mongo_cluster", key, value, relative, line, evidence, 0.9)
+            if value.startswith(("http://", "https://")) and any(term in lower_key for term in ("url", "uri", "endpoint", "service")):
+                add("downstream_http", downstream_name(key, value), value, relative, line, evidence, 0.9)
+            elif "grpc" in lower_key and any(term in lower_key for term in ("target", "endpoint", "service", "addr", "host")):
+                add("downstream_grpc", downstream_name(key, value), value, relative, line, evidence, 0.9)
+            # ADDR/HOST/TARGET 本身不能证明传输协议，只记录为中性端点；只有后续
+            # 与具体 Client/Stub 类型名称一致时，才会生成 configures_client 关联。
+            if re.search(r"(?i)(?:^|_)(?:ADDR|HOST|ENDPOINT|TARGET)$", key) and value:
+                add("endpoint_config", key, value, relative, line, evidence, 0.75)
+
+        config_pattern = re.compile(r"(?im)^\s*[\"']?([A-Za-z_][A-Za-z0-9_.-]*)[\"']?\s*[:=]\s*[\"']?([^\"'\r\n#]+)")
+        yaml_entries = _yaml_scalar_entries(text) if path.suffix.lower() in {".yaml", ".yml"} else []
+        if yaml_entries:
+            for key, value, line, evidence in yaml_entries:
+                record_config(key, value, line, evidence)
+        else:
+            for match in config_pattern.finditer(text):
+                key, value = match.group(1), match.group(2).strip().rstrip(",")
+                if not is_config_file and key.upper() != key:
+                    continue
+                record_config(key, value, _line_number(text, match.start()), match.group(0))
+
+        if has_kafka:
+            for pattern, fact_type in [
+                (re.compile(r"(?i)(?:send|publish|produce)\s*\(\s*[\"']([^\"']+)[\"']"), "kafka_topic_producer"),
+                (re.compile(r"(?i)(?:subscribe|consume)\s*\(\s*(?:\[\s*)?[\"']([^\"']+)[\"']"), "kafka_topic_consumer"),
+            ]:
+                for match in pattern.finditer(text):
+                    add(fact_type, match.group(1), match.group(1), relative, _line_number(text, match.start()), match.group(0), 0.9)
+        if has_mongo:
+            for pattern in [
+                re.compile(r"(?i)(?:get_collection|collection)\s*\(\s*[\"']([^\"']+)[\"']"),
+                re.compile(r"(?i)(?:db|database)\s*\[\s*[\"']([^\"']+)[\"']\s*\]"),
+            ]:
+                for match in pattern.finditer(text):
+                    add("mongo_collection", match.group(1), match.group(1), relative, _line_number(text, match.start()), match.group(0), 0.9)
+
+        if "gRPC" in detected_components:
+            for pattern in [
+                re.compile(r"(?i)New([A-Za-z0-9_]+)Client\s*\("),
+                re.compile(r"(?i)([A-Za-z0-9_]+)Stub\s*\("),
+            ]:
+                for match in pattern.finditer(text):
+                    add("downstream_grpc", match.group(1), None, relative, _line_number(text, match.start()), match.group(0), 0.9)
+
+            # 只做文件内、可由赋值语句证明的轻量数据流：先记录客户端变量，
+            # 再把该变量后续的方法调用关联到初始化。跨函数注入留给后续 Agent。
+            client_patterns = [
+                re.compile(r"(?m)\b(?P<variable>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*:?=\s*(?:[A-Za-z_]\w*\.)?New(?P<service>[A-Za-z_]\w*)Client\s*\("),
+                re.compile(r"(?m)\b(?P<variable>(?:self\.)?[A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)?(?P<service>[A-Za-z_]\w*)Stub\s*\("),
+                re.compile(r"(?m)\b(?:const|let|var)\s+(?P<variable>[A-Za-z_$][\w$]*)\s*=\s*new\s+(?:[A-Za-z_$][\w$]*\.)?(?P<service>[A-Za-z_$][\w$]*)Client\s*\("),
+            ]
+            client_bindings: list[tuple[str, str]] = []
+            for pattern in client_patterns:
+                for match in pattern.finditer(text):
+                    variable = match.group("variable")
+                    service = match.group("service")
+                    line = _line_number(text, match.start())
+                    client_bindings.append((variable, service))
+                    source_line = text.splitlines()[line - 1].strip() if line <= len(text.splitlines()) else match.group(0)
+                    add("client_initialization", service, variable, relative, line, source_line, 0.96)
+            for variable, service in client_bindings:
+                field_name = variable.rsplit(".", 1)[-1]
+                receiver = rf"(?:[A-Za-z_$][\w$]*\.)?{re.escape(field_name)}" if "." in variable else re.escape(variable)
+                call_pattern = re.compile(rf"\b{receiver}\.(?P<method>[A-Za-z_$][\w$]*)\s*\(")
+                for match in call_pattern.finditer(text):
+                    method = match.group("method")
+                    if method.lower() in {"close", "connect", "waitforready"}:
+                        continue
+                    add(
+                        "downstream_call", f"{service}.{method}", variable, relative,
+                        _line_number(text, match.start()), match.group(0), 0.95,
+                    )
+
+        if not is_config_file:
+            http_target = re.compile(r"(?i)(?:base_url|service_url|endpoint|url)\s*[:=(]\s*[\"'](https?://[^\"']+)[\"']")
+            for match in http_target.finditer(text):
+                value = match.group(1)
+                add("downstream_http", downstream_name("url", value), value, relative, _line_number(text, match.start()), match.group(0), 0.9)
+
+    return sorted(facts.values(), key=lambda item: (item.fact_type, item.name, item.path, item.line))
+
+
+def _architecture_identity(fact: ArchitectureFact) -> str:
+    """生成仅用于同类架构事实匹配的保守标识，不作为展示名称。"""
+    candidate = fact.name
+    if fact.fact_type.startswith("downstream_") and fact.value:
+        parsed = urlparse(fact.value)
+        if parsed.hostname:
+            candidate = fact.name or parsed.hostname
+    normalized = re.sub(r"[^a-z0-9]", "", candidate.lower())
+    if fact.fact_type in {"downstream_grpc", "client_initialization"}:
+        normalized = normalized.replace("grpc", "")
+    if fact.fact_type == "endpoint_config":
+        for suffix in ("endpoint", "target", "address", "addr", "host", "port"):
+            if normalized.endswith(suffix) and len(normalized) > len(suffix):
+                normalized = normalized[:-len(suffix)]
+                break
+    # Service/Client/Stub 是代码生成器常见后缀，配置名通常不会携带这些词。
+    for suffix in ("serviceclient", "servicestub", "service", "client", "stub"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            normalized = normalized[:-len(suffix)]
+            break
+    return normalized
+
+
+def _is_config_fact(fact: ArchitectureFact) -> bool:
+    suffix = PurePosixPath(fact.path).suffix.lower()
+    name = PurePosixPath(fact.path).name.lower()
+    return suffix in {".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".conf", ".properties"} or name.startswith(".env")
+
+
+def _architecture_links(facts: list[ArchitectureFact]) -> list[ArchitectureLink]:
+    """用精确资源名和局部客户端变量构建可验证关联，不猜测动态依赖。"""
+    links: dict[tuple, ArchitectureLink] = {}
+
+    def add(source: ArchitectureFact, target: ArchitectureFact, relation_type: str, evidence: str, confidence: float) -> None:
+        if _architecture_fact_key(source) == _architecture_fact_key(target):
+            return
+        key = (_architecture_fact_key(source), _architecture_fact_key(target), relation_type)
+        links.setdefault(key, ArchitectureLink(key[0], key[1], relation_type, evidence, confidence))
+
+    initializations = [fact for fact in facts if fact.fact_type == "client_initialization"]
+    calls = [fact for fact in facts if fact.fact_type == "downstream_call"]
+    for initialization in initializations:
+        # 同一文件、同一客户端绑定才连边。模块级客户端常在 main 中初始化，
+        # 其调用函数可能写在初始化语句之前，因此不能用源码行号代表执行先后。
+        for call in calls:
+            if (
+                call.path == initialization.path
+                and call.value == initialization.value
+            ):
+                add(
+                    initialization, call, "client_invokes",
+                    f"变量 {initialization.value} 从初始化流向 {call.name}", 0.96,
+                )
+        init_identity = _architecture_identity(initialization)
+        if not init_identity:
+            continue
+        for configured in facts:
+            if (
+                configured.fact_type in {"downstream_grpc", "endpoint_config"}
+                and _is_config_fact(configured)
+                and _architecture_identity(configured) == init_identity
+            ):
+                add(
+                    configured, initialization, "configures_client",
+                    f"配置目标 {configured.name} 与客户端 {initialization.name} 名称一致", 0.9,
+                )
+
+    exact_resource_pairs = {
+        "kafka_topic_config": {"kafka_topic_producer", "kafka_topic_consumer"},
+        "mongo_collection": {"mongo_collection"},
+    }
+    for configured in facts:
+        target_types = exact_resource_pairs.get(configured.fact_type)
+        if not target_types or not _is_config_fact(configured):
+            continue
+        configured_identity = (configured.value or configured.name).strip().casefold()
+        if not configured_identity:
+            continue
+        for usage in facts:
+            if usage.fact_type not in target_types or _is_config_fact(usage):
+                continue
+            usage_identity = (usage.value or usage.name).strip().casefold()
+            if configured_identity == usage_identity:
+                add(
+                    configured, usage, "configures_usage",
+                    f"配置值 {configured.value or configured.name} 与代码使用值完全一致", 0.98,
+                )
+
+    return sorted(links.values(), key=lambda item: (item.relation_type, item.source_fact_key, item.target_fact_key))
+
+
+def _architecture_source_symbol(fact: ArchitectureFact, files: list[FileFact]) -> SymbolFact | None:
+    """把架构证据关联到包含该行的最具体符号，无法确定时回退到文件节点。"""
+    file_fact = next((item for item in files if item.path == fact.path), None)
+    if not file_fact:
+        return None
+    business_symbols = [item for item in file_fact.symbols if item.kind != "file"]
+    containing = [item for item in business_symbols if item.start_line <= fact.line <= item.end_line]
+    if containing:
+        return min(containing, key=lambda item: (item.end_line - item.start_line, -item.start_line))
+    return next((item for item in file_fact.symbols if item.kind == "file"), None)
+
+
+def _file_inventory(root: Path) -> list[dict]:
+    """记录项目文件资产，供 Agent 先发现文件类型和解析覆盖率，不把配置误当成代码符号。"""
+    config_names = {"dockerfile", "makefile", "procfile", "jenkinsfile", "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"}
+    config_suffixes = {".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env"}
+    language_names = {".py": "python", ".go": "go", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript", ".java": "java"}
+    inventory = []
+    ignored = {item.lower() for item in IGNORED_DIRS}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part.lower() in ignored for part in path.relative_to(root).parts):
+            continue
+        relative = path.relative_to(root).as_posix()
+        name = path.name.lower()
+        suffix = path.suffix.lower()
+        if suffix not in language_names and suffix not in config_suffixes and name not in config_names:
+            role, parser_status, parser_name = "other", "unclassified", None
+        elif suffix in language_names:
+            role, parser_status, parser_name = "source_code", "parsed", "tree-sitter/scip"
+        elif name in config_names:
+            role, parser_status, parser_name = "deployment_config", "partial", "format-specific config parser"
+        else:
+            role, parser_status, parser_name = "config", "partial", "yaml/json config parser" if suffix in {".yaml", ".yml", ".json"} else "text config parser"
+        try:
+            size = path.stat().st_size
+            line_count = len(_read_text(path).splitlines()) if size <= 2 * 1024 * 1024 else None
+            # 小文本沿用解码后的哈希，便于读取时复核；大文件用流式原始字节哈希参与版本号。
+            content_hash = _hash_text(_read_text(path)) if size <= 2 * 1024 * 1024 else _hash_file_bytes(path)
+        except OSError:
+            size, line_count, content_hash = 0, None, None
+        detected_format = None
+        if name in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}:
+            detected_format = "docker_compose"
+        elif name == "values.yaml" or name.endswith("-values.yaml"):
+            detected_format = "helm_values"
+        elif "otel" in name or "opentelemetry" in name:
+            detected_format = "possible_observability_config"
+        inventory.append({"path": relative, "file_name": path.name, "extension": suffix, "file_role": role, "detected_format": detected_format, "language": language_names.get(suffix), "size_bytes": size, "line_count": line_count, "content_hash": content_hash, "parser_status": parser_status, "parser_name": parser_name})
+    return inventory
+
+
+def scan_project(root_path: str, workspace_id: str | None = None) -> dict:
     """扫描项目并返回可入库的事实；不调用模型，便于重复运行和自动测试。"""
     root = Path(root_path).expanduser().resolve()
+    workspace_id = workspace_id or settings.workspace_id
     if not root.is_dir():
         raise ValueError("project path must be an existing directory")
     commit_hash, commit_source = _git_commit(root)
     files = [_extract_file(root, path) for path in _iter_source_files(root)]
-    # 浏览器上传目录没有 Git HEAD，以源码路径和内容哈希生成版本，确保内容变化会产生新快照。
+    file_inventory = _file_inventory(root)
+    # 非 Git 项目必须覆盖全部可读取资产，而不只是进入符号索引的源码；否则只修改
+    # YAML/Compose/Helm 时版本号不变，会错误复用旧快照目录。
     if commit_source == "content_scan":
-        snapshot = "\n".join(f"{item.path}:{item.content_hash}" for item in sorted(files, key=lambda item: item.path))
+        snapshot = "\n".join(
+            f"{item['path']}:{item.get('content_hash') or 'unreadable'}:{item.get('size_bytes', 0)}"
+            for item in sorted(file_inventory, key=lambda item: item["path"])
+        )
         commit_hash = "scan-" + _hash_text(snapshot)[:16]
     indexers = _scip_indexer_status()
-    scip_report = {"go": _run_go_scip(root, files, indexers)}
+    scip_report = {
+        "go": _run_go_scip(root, files, indexers),
+        "python": _run_python_scip(root, files, indexers),
+    }
     components = _component_facts(root, files)
+    architecture_facts = _architecture_facts(root)
+    architecture_links = _architecture_links(architecture_facts)
+    config_facts = parse_project_configs(root)
     return {
-        "project_id": str(uuid.uuid5(ID_NAMESPACE, str(root))),
+        # 旧的默认空间沿用历史 ID；其他空间把 workspace 纳入身份，避免同仓库相互覆盖。
+        "project_id": str(uuid.uuid5(ID_NAMESPACE, str(root) if workspace_id == settings.workspace_id else f"{workspace_id}:{root}")),
+        "workspace_id": workspace_id,
         "project_name": root.name,
         "root_path": str(root),
         "commit_hash": commit_hash,
@@ -859,7 +1498,11 @@ def scan_project(root_path: str) -> dict:
         "scip_indexers": indexers,
         "scip": scip_report,
         "files": files,
+        "file_inventory": file_inventory,
         "components": components,
+        "architecture_facts": architecture_facts,
+        "architecture_links": architecture_links,
+        "config_facts": config_facts,
     }
 
 
@@ -880,6 +1523,28 @@ def initialize_code_wiki() -> None:
             )
         """)
         conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS scan_metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+        # 项目也必须和 RAG 文档一样绑定工作空间；旧项目统一迁移到当前 MVP 空间。
+        conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS workspace_id TEXT")
+        conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
+        conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS created_by_user_id TEXT")
+        conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS access_scope TEXT NOT NULL DEFAULT 'workspace'")
+        conn.execute("ALTER TABLE code_projects ADD COLUMN IF NOT EXISTS repository_key TEXT")
+        conn.execute("UPDATE code_projects SET workspace_id = %s WHERE workspace_id IS NULL", (settings.workspace_id,))
+        conn.execute("UPDATE code_projects SET owner_user_id = %s WHERE owner_user_id IS NULL", (settings.current_user_id,))
+        conn.execute("UPDATE code_projects SET created_by_user_id = owner_user_id WHERE created_by_user_id IS NULL")
+        conn.execute("ALTER TABLE code_projects ALTER COLUMN workspace_id SET NOT NULL")
+        conn.execute("ALTER TABLE code_projects ALTER COLUMN owner_user_id SET NOT NULL")
+        conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_code_projects_access_scope') THEN
+                    ALTER TABLE code_projects ADD CONSTRAINT ck_code_projects_access_scope
+                    CHECK (access_scope IN ('private', 'workspace'));
+                END IF;
+            END $$
+            """
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS code_files (
                 file_id UUID PRIMARY KEY,
@@ -891,6 +1556,19 @@ def initialize_code_wiki() -> None:
                 line_count INTEGER NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(project_id, commit_hash, path)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_project_snapshots (
+                -- 项目与 Commit 共同标识一个不可变源码/索引快照。
+                project_id UUID NOT NULL REFERENCES code_projects(project_id) ON DELETE CASCADE,
+                commit_hash TEXT NOT NULL,
+                -- 该 Commit 对应的不可变托管源码目录；Agent 按此路径读取原文。
+                root_path TEXT NOT NULL,
+                -- 文件资产、配置事实和 SCIP 诊断均绑定到 Commit，不能只保存在项目当前态。
+                scan_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (project_id, commit_hash)
             )
         """)
         conn.execute("""
@@ -936,51 +1614,177 @@ def initialize_code_wiki() -> None:
                 UNIQUE(project_id, commit_hash, name, category)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_architecture_facts (
+                fact_id UUID PRIMARY KEY,
+                project_id UUID NOT NULL REFERENCES code_projects(project_id) ON DELETE CASCADE,
+                commit_hash TEXT NOT NULL,
+                fact_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value TEXT,
+                source_path TEXT NOT NULL,
+                source_line INTEGER NOT NULL,
+                evidence TEXT NOT NULL,
+                source_symbol_id UUID REFERENCES code_symbols(symbol_id) ON DELETE SET NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                UNIQUE(project_id, commit_hash, fact_type, name, value, source_path, source_line)
+            )
+        """)
+        conn.execute("ALTER TABLE code_architecture_facts ADD COLUMN IF NOT EXISTS source_symbol_id UUID REFERENCES code_symbols(symbol_id) ON DELETE SET NULL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_architecture_links (
+                link_id UUID PRIMARY KEY,
+                project_id UUID NOT NULL REFERENCES code_projects(project_id) ON DELETE CASCADE,
+                commit_hash TEXT NOT NULL,
+                source_fact_id UUID NOT NULL REFERENCES code_architecture_facts(fact_id) ON DELETE CASCADE,
+                target_fact_id UUID NOT NULL REFERENCES code_architecture_facts(fact_id) ON DELETE CASCADE,
+                relation_type TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                UNIQUE(project_id, commit_hash, source_fact_id, target_fact_id, relation_type)
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_project ON code_files(project_id, commit_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(project_id, name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_code_relations_source ON code_relations(source_symbol_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_code_relations_target ON code_relations(target_symbol_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_code_architecture_facts_project ON code_architecture_facts(project_id, commit_hash, fact_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_code_architecture_links_project ON code_architecture_links(project_id, commit_hash, relation_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_code_project_snapshots_root ON code_project_snapshots(root_path)")
+        # 规范化仓库键由应用生成，唯一索引防止并发或大小写变体建立重复项目。
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_code_projects_workspace_repository_key "
+            "ON code_projects(workspace_id, repository_key) WHERE repository_key IS NOT NULL"
+        )
+        # 旧项目只有当前 root_path；先把它登记为第一个快照，保持升级中的 Agent 可读。
+        conn.execute(
+            """INSERT INTO code_project_snapshots (project_id, commit_hash, root_path, scan_metadata)
+               SELECT project_id, current_commit, root_path, scan_metadata FROM code_projects
+               ON CONFLICT (project_id, commit_hash) DO NOTHING"""
+        )
+        # 旧实现可能保留非当前 Commit 的事实，却没有对应源码目录。把它们指向当前
+        # root_path 会制造假快照，因此升级时只删除这些已无法复核的孤立历史事实。
+        for table in (
+            "code_architecture_links", "code_relations", "code_symbols",
+            "code_files", "code_components", "code_architecture_facts",
+        ):
+            conn.execute(f"""
+                DELETE FROM {table} item
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM code_project_snapshots snapshot
+                    WHERE snapshot.project_id = item.project_id
+                      AND snapshot.commit_hash = item.commit_hash
+                )
+            """)
+        # 所有版本化事实必须属于一个已登记快照；NOT VALID 先兼容升级，再立即验证现有数据。
+        for constraint, table in (
+            ("fk_code_files_snapshot", "code_files"),
+            ("fk_code_symbols_snapshot", "code_symbols"),
+            ("fk_code_relations_snapshot", "code_relations"),
+            ("fk_code_components_snapshot", "code_components"),
+            ("fk_code_architecture_facts_snapshot", "code_architecture_facts"),
+            ("fk_code_architecture_links_snapshot", "code_architecture_links"),
+        ):
+            conn.execute(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{constraint}') THEN
+                        ALTER TABLE {table} ADD CONSTRAINT {constraint}
+                        FOREIGN KEY (project_id, commit_hash)
+                        REFERENCES code_project_snapshots(project_id, commit_hash)
+                        ON DELETE CASCADE NOT VALID;
+                    END IF;
+                END $$
+            """)
+            conn.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}")
         conn.execute("COMMENT ON TABLE code_projects IS '代码 Wiki 项目事实层：项目和当前扫描版本'")
         conn.execute("COMMENT ON COLUMN code_projects.scan_metadata IS '最近一次扫描的来源、SCIP CLI 状态、模块结果、索引哈希和错误摘要'")
+        conn.execute("COMMENT ON COLUMN code_projects.workspace_id IS '代码项目所属工作空间；跨空间查询永远不允许'")
+        conn.execute("COMMENT ON COLUMN code_projects.owner_user_id IS '代码项目所有者；重新扫描不会隐式转移所有权'")
+        conn.execute("COMMENT ON COLUMN code_projects.created_by_user_id IS '首次扫描或导入代码项目的用户'")
+        conn.execute("COMMENT ON COLUMN code_projects.access_scope IS '项目访问范围：private 仅所有者/ACL，workspace 对空间成员开放'")
+        conn.execute("COMMENT ON COLUMN code_projects.repository_key IS '工作空间内大小写无关的稳定仓库身份键，用于幂等导入和并发约束'")
         conn.execute("COMMENT ON TABLE code_files IS '代码 Wiki 文件事实：路径、语言、内容哈希和 Commit'")
         conn.execute("COMMENT ON TABLE code_symbols IS '代码 Wiki 符号事实：类、函数、方法和精确源代码范围'")
         conn.execute("COMMENT ON TABLE code_relations IS '代码 Wiki 关系事实：导入、调用和后续跨项目关系'")
         conn.execute("COMMENT ON TABLE code_components IS '代码 Wiki 组件识别结果及其依赖文件/初始化代码证据'")
+        conn.execute("COMMENT ON TABLE code_architecture_facts IS '架构理解层确定性事实：组件、消息资源、数据库资源和下游服务及其代码证据'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.fact_id IS '架构事实唯一 ID'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.project_id IS '事实所属代码项目 ID'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.commit_hash IS '事实对应的 Git Commit 或内容扫描版本'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.fact_type IS '事实类型，例如 component、kafka_topic_producer、mongo_collection 或 downstream_http'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.name IS '组件、资源或下游服务的可读名称'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.value IS '脱敏后的配置值、资源名或目标地址'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.source_path IS '产生该事实的项目内相对文件路径'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.source_line IS '产生该事实的源码或配置行号，从 1 开始'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.evidence IS '经过脱敏和截断的原始证据片段'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.source_symbol_id IS '证据所在或紧邻的代码符号，用于从架构事实跳转到定义与关系'")
+        conn.execute("COMMENT ON COLUMN code_architecture_facts.confidence IS '确定性规则给出的证据置信度，范围 0 到 1'")
+        conn.execute("COMMENT ON TABLE code_architecture_links IS '配置、客户端初始化和实际资源调用之间的可验证架构关联'")
+        conn.execute("COMMENT ON TABLE code_project_snapshots IS '代码项目不可变 Commit 快照；固定 Agent 请求期间的源码与扫描元数据'")
+        conn.execute("COMMENT ON COLUMN code_architecture_links.relation_type IS '关联类型，例如 configures_client、client_invokes 或 configures_usage'")
+        conn.execute("COMMENT ON COLUMN code_architecture_links.evidence IS '建立关联所依据的变量、服务名或精确资源值证据'")
 
 
 def _symbol_id(project_id: str, commit_hash: str, path: str, qualified: str, line: int) -> str:
     return str(uuid.uuid5(ID_NAMESPACE, f"{project_id}:{commit_hash}:{path}:{qualified}:{line}"))
 
 
+def _architecture_fact_id(project_id: str, commit_hash: str, fact: ArchitectureFact) -> str:
+    """事实 ID 由内容与位置稳定生成，供架构关联边幂等引用。"""
+    return str(uuid.uuid5(ID_NAMESPACE, f"arch:{project_id}:{commit_hash}:{_architecture_fact_key(fact)!r}"))
+
+
 def persist_scan(scan: dict) -> dict:
     """以 Commit 为边界幂等写入扫描结果；同一版本重复扫描不会叠加关系。"""
     project_id = scan["project_id"]
     commit_hash = scan["commit_hash"]
+    scan_metadata = {
+        "scip_indexers": scan.get("scip_indexers", {}),
+        "scip": scan.get("scip", {}),
+        "source": scan.get("source", {"type": "local", "path": scan["root_path"]}),
+        "file_inventory": scan.get("file_inventory", [])[:10000],
+        "config_facts": scan.get("config_facts", [])[:20000],
+    }
     with connection() as conn:
         conn.execute(
             """INSERT INTO code_projects
-            (project_id, project_name, root_path, current_commit, current_commit_source, scan_metadata)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            (project_id, project_name, root_path, current_commit, current_commit_source,
+             workspace_id, owner_user_id, created_by_user_id, access_scope, repository_key, scan_metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'workspace', %s, %s::jsonb)
             ON CONFLICT (project_id) DO UPDATE SET
               project_name = EXCLUDED.project_name, root_path = EXCLUDED.root_path,
               current_commit = EXCLUDED.current_commit, current_commit_source = EXCLUDED.current_commit_source,
+              workspace_id = EXCLUDED.workspace_id,
+              owner_user_id = code_projects.owner_user_id,
+              created_by_user_id = COALESCE(code_projects.created_by_user_id, EXCLUDED.created_by_user_id),
+              repository_key = COALESCE(code_projects.repository_key, EXCLUDED.repository_key),
               scan_metadata = EXCLUDED.scan_metadata,
               updated_at = NOW()""",
             (project_id, scan["project_name"], scan["root_path"], commit_hash, scan["commit_source"],
-             json.dumps({
-                 "scip_indexers": scan.get("scip_indexers", {}),
-                 "scip": scan.get("scip", {}),
-                 "source": scan.get("source", {"type": "local", "path": scan["root_path"]}),
-             }, ensure_ascii=False)),
+             scan.get("workspace_id", settings.workspace_id), scan.get("owner_user_id", settings.current_user_id),
+             scan.get("created_by_user_id", scan.get("owner_user_id", settings.current_user_id)),
+             scan.get("source", {}).get("repository_key"),
+             json.dumps(scan_metadata, ensure_ascii=False)),
+        )
+        conn.execute(
+            """INSERT INTO code_project_snapshots (project_id, commit_hash, root_path, scan_metadata)
+               VALUES (%s, %s, %s, %s::jsonb)
+               ON CONFLICT (project_id, commit_hash) DO UPDATE SET
+                 root_path = EXCLUDED.root_path,
+                 scan_metadata = EXCLUDED.scan_metadata""",
+            (project_id, commit_hash, scan["root_path"], json.dumps(scan_metadata, ensure_ascii=False)),
         )
         # 重新扫描同一 Commit 时先替换该版本事实，避免旧的符号/关系残留。
         conn.execute("DELETE FROM code_relations WHERE project_id = %s AND commit_hash = %s", (project_id, commit_hash))
         conn.execute("DELETE FROM code_symbols WHERE project_id = %s AND commit_hash = %s", (project_id, commit_hash))
         conn.execute("DELETE FROM code_files WHERE project_id = %s AND commit_hash = %s", (project_id, commit_hash))
         conn.execute("DELETE FROM code_components WHERE project_id = %s AND commit_hash = %s", (project_id, commit_hash))
+        conn.execute("DELETE FROM code_architecture_facts WHERE project_id = %s AND commit_hash = %s", (project_id, commit_hash))
 
         symbol_ids: dict[str, str] = {}
         file_ids: dict[str, str] = {}
+        inserted_symbol_ids: set[str] = set()
         for file_fact in scan["files"]:
             file_id = str(uuid.uuid5(ID_NAMESPACE, f"file:{project_id}:{commit_hash}:{file_fact.path}"))
             file_ids[file_fact.path] = file_id
@@ -993,6 +1797,11 @@ def persist_scan(scan: dict) -> dict:
             for symbol in file_fact.symbols:
                 symbol.symbol_id = _symbol_id(project_id, commit_hash, symbol.path, symbol.qualified_name, symbol.start_line)
                 symbol_ids[f"{symbol.path}::{symbol.qualified_name}"] = symbol.symbol_id
+                # Tree-sitter 与 SCIP 可能对同一事实各产出一次；稳定 ID 相同时只写一条，
+                # 防止单个索引器的重复 occurrence 让整个项目事务回滚。
+                if symbol.symbol_id in inserted_symbol_ids:
+                    continue
+                inserted_symbol_ids.add(symbol.symbol_id)
                 conn.execute(
                     """INSERT INTO code_symbols
                     (symbol_id, project_id, file_id, commit_hash, name, qualified_name, symbol_kind,
@@ -1029,33 +1838,235 @@ def persist_scan(scan: dict) -> dict:
                 (str(uuid.uuid4()), project_id, commit_hash, component["name"], component["category"],
                  component["confidence"], json.dumps(component["evidence"], ensure_ascii=False)),
             )
+        architecture_fact_ids: dict[tuple[str, str, str | None, str, int], str] = {}
+        for fact in scan.get("architecture_facts", []):
+            source_symbol = _architecture_source_symbol(fact, scan["files"])
+            fact_id = _architecture_fact_id(project_id, commit_hash, fact)
+            architecture_fact_ids[_architecture_fact_key(fact)] = fact_id
+            conn.execute(
+                """INSERT INTO code_architecture_facts
+                (fact_id, project_id, commit_hash, fact_type, name, value, source_path, source_line, evidence, source_symbol_id, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING""",
+                (fact_id, project_id, commit_hash, fact.fact_type, fact.name, fact.value,
+                 fact.path, fact.line, fact.evidence, source_symbol.symbol_id if source_symbol else None, fact.confidence),
+            )
+        for link in scan.get("architecture_links", []):
+            source_fact_id = architecture_fact_ids.get(link.source_fact_key)
+            target_fact_id = architecture_fact_ids.get(link.target_fact_key)
+            if not source_fact_id or not target_fact_id:
+                continue
+            link_id = str(uuid.uuid5(
+                ID_NAMESPACE,
+                f"arch-link:{project_id}:{commit_hash}:{source_fact_id}:{target_fact_id}:{link.relation_type}",
+            ))
+            conn.execute(
+                """INSERT INTO code_architecture_links
+                (link_id, project_id, commit_hash, source_fact_id, target_fact_id, relation_type, evidence, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING""",
+                (link_id, project_id, commit_hash, source_fact_id, target_fact_id,
+                 link.relation_type, link.evidence, link.confidence),
+            )
     return {
         "project_id": project_id, "project_name": scan["project_name"], "commit_hash": commit_hash,
         "file_count": len(scan["files"]),
         "symbol_count": sum(len(file_fact.symbols) for file_fact in scan["files"]),
         "relation_count": sum(len(file_fact.relations) for file_fact in scan["files"]),
         "component_count": len(scan["components"]),
+        "architecture_fact_count": len(scan.get("architecture_facts", [])),
+        "architecture_link_count": len(scan.get("architecture_links", [])),
         "scip_indexers": scan.get("scip_indexers", {}),
         "scip": scan.get("scip", {}),
+        "file_inventory_count": len(scan.get("file_inventory", [])),
+        "config_fact_count": len(scan.get("config_facts", [])),
     }
 
 
-def list_code_projects() -> list[dict]:
+@contextmanager
+def repository_import_lock(workspace_id: str, resource_key: str):
+    """使用 PostgreSQL session advisory lock 串行化同一代码项目的导入。"""
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"code-import:{workspace_id}:{resource_key.casefold()}".encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+    lock_connection = psycopg.connect(settings.database_url, autocommit=True)
+    acquired = False
+    try:
+        acquired = lock_connection.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
+        if not acquired:
+            raise RepositoryImportBusy("repository import already running")
+        yield
+    finally:
+        try:
+            if acquired:
+                lock_connection.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        finally:
+            lock_connection.close()
+
+
+def import_and_scan_github_repository(
+    repository_url: str,
+    workspace_id: str,
+    owner_user_id: str,
+) -> dict:
+    """以不可变 Commit 快照导入 GitHub；失败时不改变当前 DB 指针和旧源码。"""
+    canonical_url, owner, repository = normalize_github_url(repository_url)
+    managed_root = DEFAULT_REPOSITORY_ROOT.resolve()
+    if workspace_id != settings.workspace_id:
+        managed_root = managed_root / workspace_id
+    managed_root.mkdir(parents=True, exist_ok=True)
+    # GitHub 仓库身份大小写无关，避免 URL 大小写变体绕过项目锁和幂等 ID。
+    repository_key = github_repository_key(owner, repository)
+    stable_identity_path = managed_root / repository_key
+    project_id = managed_code_project_id(stable_identity_path, workspace_id)
+
+    with repository_import_lock(workspace_id, f"project:{project_id}"):
+        with connection() as conn:
+            existed = conn.execute(
+                "SELECT 1 FROM code_projects WHERE project_id = %s AND workspace_id = %s",
+                (project_id, workspace_id),
+            ).fetchone() is not None
+
+        staging_root = Path(tempfile.mkdtemp(prefix=f".{repository_key}-", dir=managed_root))
+        staging_repository = staging_root / "repository"
+        promoted_path: Path | None = None
+        promoted_here = False
+        try:
+            _run_git(["git", "clone", "--depth", "1", canonical_url, str(staging_repository)])
+            scan = scan_project(str(staging_repository), workspace_id)
+            commit_hash = str(scan["commit_hash"])
+            safe_commit = re.sub(r"[^A-Za-z0-9._-]", "-", commit_hash)[:80]
+            snapshots_root = managed_root / ".snapshots" / repository_key
+            snapshots_root.mkdir(parents=True, exist_ok=True)
+            promoted_path = snapshots_root / safe_commit
+            if promoted_path.exists():
+                existing_commit, _ = _git_commit(promoted_path)
+                if existing_commit != commit_hash:
+                    raise RuntimeError("existing repository snapshot does not match its commit")
+                _remove_managed_tree(staging_repository)
+            else:
+                os.replace(staging_repository, promoted_path)
+                promoted_here = True
+
+            # project_id 来自稳定仓库身份，不受随机 staging 或 Commit 目录影响。
+            scan.update({
+                "project_id": project_id,
+                "project_name": repository,
+                "root_path": str(promoted_path.resolve()),
+                "workspace_id": workspace_id,
+                "owner_user_id": owner_user_id,
+                "created_by_user_id": owner_user_id,
+                "source": {
+                    "type": "github",
+                    "repository_url": canonical_url.removesuffix(".git"),
+                    "owner": owner,
+                    "repository": repository,
+                    "repository_key": repository_key,
+                },
+            })
+            result = persist_scan(scan)
+            return {
+                "import_action": "updated" if existed else "cloned",
+                "repository_url": canonical_url.removesuffix(".git"),
+                **result,
+            }
+        except Exception:
+            # 只有本次新建且尚未被 DB 激活的快照才回收；既有同 Commit 快照不动。
+            if promoted_here and promoted_path and promoted_path.exists():
+                _remove_managed_tree(promoted_path)
+            raise
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def list_code_projects(workspace_id: str | None = None, user_id: str | None = None) -> list[dict]:
+    """只列出服务端已授权空间中的项目，避免前端看到其他空间项目。"""
+    workspace_id = workspace_id or settings.workspace_id
+    user_id = user_id or settings.current_user_id
     with connection() as conn:
         result = conn.execute(
             """SELECT project_id, project_name, root_path, current_commit, current_commit_source,
-                      status, scan_metadata, created_at, updated_at
-               FROM code_projects ORDER BY updated_at DESC"""
+                      status, scan_metadata, workspace_id, owner_user_id, access_scope, created_at, updated_at
+               FROM code_projects
+               WHERE workspace_id = %s AND status = 'active'
+                 AND (access_scope = 'workspace' OR owner_user_id = %s
+                      OR EXISTS (SELECT 1 FROM code_project_access a WHERE a.project_id = code_projects.project_id AND a.user_id = %s AND a.status = 'active'))
+               ORDER BY updated_at DESC""", (workspace_id, user_id, user_id)
         )
         columns = [desc.name for desc in result.description]
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
-def get_code_overview(project_id: str) -> dict | None:
+def delete_code_projects(
+    project_ids: list[str],
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+    workspace_role: str | None = None,
+) -> dict:
+    """批量删除代码项目及其托管副本；外部源码目录永远不会被删除。"""
+    unique_ids = list(dict.fromkeys(project_ids))
+    if not unique_ids:
+        return {"deleted": [], "missing": [], "filesystem_errors": []}
+    managed_root = DEFAULT_REPOSITORY_ROOT.resolve()
+    deleted: list[str] = []
+    missing: list[str] = []
+    filesystem_errors: list[dict] = []
+    workspace_id = workspace_id or settings.workspace_id
+    user_id = user_id or settings.current_user_id
+    for project_id in unique_ids:
+        # 删除与导入竞争同一把项目锁，避免旧目录清理误删刚完成的新快照。
+        with repository_import_lock(workspace_id, f"project:{project_id}"):
+            repository_paths: list[Path] = []
+            with connection() as conn:
+                row = conn.execute(
+                    """SELECT project_id, root_path FROM code_projects
+                       WHERE project_id = %s AND workspace_id = %s
+                         AND (%s IN ('owner', 'admin') OR (%s = 'editor' AND owner_user_id = %s) OR EXISTS (
+                             SELECT 1 FROM code_project_access a
+                             WHERE a.project_id = code_projects.project_id AND a.user_id = %s
+                               AND a.permission = 'admin' AND a.status = 'active'
+                         ))""",
+                    (project_id, workspace_id, workspace_role or '', workspace_role or '', user_id, user_id),
+                ).fetchone()
+                if not row:
+                    missing.append(project_id)
+                    continue
+                snapshot_paths = conn.execute(
+                    "SELECT root_path FROM code_project_snapshots WHERE project_id = %s",
+                    (project_id,),
+                ).fetchall()
+                for raw_path in {row[1], *(item[0] for item in snapshot_paths)}:
+                    candidate = Path(raw_path).expanduser().resolve()
+                    if candidate != managed_root and managed_root in candidate.parents:
+                        repository_paths.append(candidate)
+                # ON DELETE CASCADE 会同步删除项目下的文件、符号、关系和架构事实。
+                conn.execute("DELETE FROM code_projects WHERE project_id = %s", (project_id,))
+                deleted.append(str(row[0]))
+
+            # connection 上下文已提交删除，但仍持有项目锁，因此同项目不能在清理期间重建。
+            for repository_path in repository_paths:
+                try:
+                    if repository_path.exists():
+                        _remove_managed_tree(repository_path)
+                except OSError:
+                    # 前端只需要知道哪个托管快照清理失败；绝对路径和 OS 错误保留在日志。
+                    logger.exception("managed_repository_cleanup_failed path=%s", repository_path)
+                    filesystem_errors.append({
+                        "repository": repository_path.name,
+                        "error_code": "MANAGED_REPOSITORY_CLEANUP_FAILED",
+                    })
+    return {"deleted": deleted, "missing": missing, "filesystem_errors": filesystem_errors}
+
+
+def get_code_overview(project_id: str, workspace_id: str | None = None) -> dict | None:
+    """读取项目详情时再次校验空间，不能只依赖上游列表接口。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         project = conn.execute(
             """SELECT project_id, project_name, root_path, current_commit, current_commit_source, status, scan_metadata
-               FROM code_projects WHERE project_id = %s""", (project_id,)
+               FROM code_projects WHERE project_id = %s AND workspace_id = %s""", (project_id, workspace_id)
         ).fetchone()
         if not project:
             return None
@@ -1078,7 +2089,69 @@ def get_code_overview(project_id: str) -> dict | None:
                 {"name": item[0], "category": item[1], "confidence": item[2], "evidence": item[3]}
                 for item in components
             ],
+            "architecture_facts": _list_architecture_facts(conn, project_id, project[3]),
+            "architecture_links": _list_architecture_links(conn, project_id, project[3]),
         }
+
+
+def _list_architecture_facts(conn, project_id: str, commit_hash: str) -> list[dict]:
+    """读取当前 Commit 的架构事实，供项目概览和后续 Agent 查询工具复用。"""
+    result = conn.execute(
+        """SELECT fact_id, fact_type, name, value, source_path, source_line, evidence, source_symbol_id, confidence
+           FROM code_architecture_facts
+           WHERE project_id = %s AND commit_hash = %s
+           ORDER BY fact_type, name, source_path, source_line""",
+        (project_id, commit_hash),
+    )
+    columns = [desc.name for desc in result.description]
+    return [dict(zip(columns, row)) for row in result.fetchall()]
+
+
+def _list_architecture_links(conn, project_id: str, commit_hash: str) -> list[dict]:
+    """返回关联边及两端事实，Agent 不需要再用名称进行二次猜测。"""
+    result = conn.execute(
+        """SELECT l.link_id, l.relation_type, l.evidence, l.confidence,
+                  sf.fact_id AS source_fact_id, sf.fact_type AS source_fact_type,
+                  sf.name AS source_name, sf.value AS source_value,
+                  sf.source_path AS source_path, sf.source_line AS source_line,
+                  sf.source_symbol_id AS source_symbol_id,
+                  tf.fact_id AS target_fact_id, tf.fact_type AS target_fact_type,
+                  tf.name AS target_name, tf.value AS target_value,
+                  tf.source_path AS target_path, tf.source_line AS target_line,
+                  tf.source_symbol_id AS target_symbol_id
+           FROM code_architecture_links l
+           JOIN code_architecture_facts sf ON sf.fact_id = l.source_fact_id
+           JOIN code_architecture_facts tf ON tf.fact_id = l.target_fact_id
+           WHERE l.project_id = %s AND l.commit_hash = %s
+           ORDER BY l.relation_type, sf.name, tf.name""",
+        (project_id, commit_hash),
+    )
+    columns = [desc.name for desc in result.description]
+    return [dict(zip(columns, row)) for row in result.fetchall()]
+
+
+def list_code_architecture(project_id: str, commit_hash: str | None = None) -> list[dict]:
+    """返回指定 Commit 的架构事实；未指定时仅供页面读取当前版本。"""
+    with connection() as conn:
+        if not commit_hash:
+            project = conn.execute(
+                "SELECT current_commit FROM code_projects WHERE project_id = %s",
+                (project_id,),
+            ).fetchone()
+            commit_hash = project[0] if project else None
+        return _list_architecture_facts(conn, project_id, commit_hash) if commit_hash else []
+
+
+def list_code_architecture_links(project_id: str, commit_hash: str | None = None) -> list[dict]:
+    """返回指定 Commit 的配置到调用关联；页面可省略 Commit。"""
+    with connection() as conn:
+        if not commit_hash:
+            project = conn.execute(
+                "SELECT current_commit FROM code_projects WHERE project_id = %s",
+                (project_id,),
+            ).fetchone()
+            commit_hash = project[0] if project else None
+        return _list_architecture_links(conn, project_id, commit_hash) if commit_hash else []
 
 
 def list_code_files(project_id: str) -> list[dict]:
@@ -1101,20 +2174,151 @@ def list_code_files(project_id: str) -> list[dict]:
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
+def list_code_file_inventory(
+    project_id: str, query: str = "", limit: int = 200, offset: int = 0,
+    commit_hash: str | None = None,
+) -> dict:
+    """返回指定 Commit 的文件资产；Agent 必须传入会话锁定的 Commit。"""
+    with connection() as conn:
+        if commit_hash:
+            row = conn.execute(
+                "SELECT commit_hash, scan_metadata FROM code_project_snapshots WHERE project_id = %s AND commit_hash = %s",
+                (project_id, commit_hash),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT current_commit, scan_metadata FROM code_projects WHERE project_id = %s", (project_id,)
+            ).fetchone()
+    if not row:
+        return {"project_id": project_id, "items": [], "coverage": {}}
+    items = row[1].get("file_inventory", []) if isinstance(row[1], dict) else []
+    term = query.strip().casefold()
+    aliases = {
+        "配置": ("config", "yaml", "yml", "compose", "helm", "env", "toml", "json", "properties", "cfg", "conf"),
+        "配置文件": ("config", "yaml", "yml", "compose", "helm", "env", "toml", "json", "properties", "cfg", "conf"),
+        "部署": ("deployment", "compose", "helm", "docker", "kubernetes", "yaml", "yml"),
+        "yaml": ("yaml", "yml"), "yml": ("yaml", "yml"), "compose": ("compose",),
+        "helm": ("helm", "values", "template"), "env": (".env", "env"),
+    }
+    terms = aliases.get(term, (term,)) if term else ()
+    if terms:
+        items = [item for item in items if any(token in " ".join(str(value or "") for value in item.values()).casefold() for token in terms)]
+    counts = {"total": len(row[1].get("file_inventory", [])) if isinstance(row[1], dict) else 0}
+    counts.update({status: sum(1 for item in (row[1].get("file_inventory", []) if isinstance(row[1], dict) else []) if item.get("parser_status") == status) for status in ("parsed", "partial", "unsupported", "unclassified")})
+    safe_offset = max(0, offset)
+    safe_limit = max(1, min(limit, 200))
+    return {"project_id": project_id, "commit_hash": row[0], "items": items[safe_offset:safe_offset + safe_limit], "offset": safe_offset, "limit": safe_limit, "has_more": safe_offset + safe_limit < len(items), "coverage": counts}
+
+
+def list_code_config_facts(
+    project_id: str,
+    query: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    path_prefix: str = "",
+    fact_types: list[str] | None = None,
+    formats: list[str] | None = None,
+    citations=None,
+    commit_hash: str | None = None,
+) -> dict:
+    """返回指定 Commit 的通用配置事实，避免导入并发时跨版本取证。"""
+    with connection() as conn:
+        if commit_hash:
+            row = conn.execute(
+                "SELECT root_path, commit_hash, scan_metadata FROM code_project_snapshots WHERE project_id = %s AND commit_hash = %s",
+                (project_id, commit_hash),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT root_path, current_commit, scan_metadata FROM code_projects WHERE project_id = %s", (project_id,)
+            ).fetchone()
+    if not row:
+        return {"project_id": project_id, "items": [], "count": 0}
+    metadata = row[2] if isinstance(row[2], dict) else {}
+    items = metadata.get("config_facts", [])
+    term = query.strip().casefold()
+    # 中文泛化查询表示“配置这一层”，不应被当成英文路径关键字而过滤为空。
+    config_aliases = {
+        "配置": (), "配置文件": (), "部署": (),
+        "yaml": ("yaml", "yml"), "yml": ("yaml", "yml"),
+        "compose": ("compose",), "docker compose": ("compose",),
+        "helm": ("helm", "values", "template"),
+    }
+    terms = config_aliases.get(term, (term,)) if term else ()
+    if terms:
+        items = [item for item in items if any(token in " ".join(str(value or "") for value in item.values()).casefold() for token in terms)]
+    prefix = path_prefix.strip().replace("\\", "/").strip("/").casefold()
+    if prefix:
+        items = [item for item in items if str(item.get("path", "")).replace("\\", "/").casefold().startswith(prefix)]
+    wanted_types = {str(value).strip().casefold() for value in (fact_types or []) if str(value).strip()}
+    if wanted_types:
+        items = [item for item in items if str(item.get("fact_type", "")).casefold() in wanted_types]
+    wanted_formats = {str(value).strip().casefold() for value in (formats or []) if str(value).strip()}
+    if wanted_formats:
+        items = [item for item in items if str(item.get("config_format", "")).casefold() in wanted_formats]
+    if citations is not None:
+        for item in items[:500]:
+            item["citation"] = f"[{citations.add(item.get('path', ''), item.get('line', 1), item.get('key_path', item.get('fact_type', 'config')))}]"
+    safe_offset = max(0, offset)
+    safe_limit = max(1, min(limit, 100))
+    return {"project_id": project_id, "commit_hash": row[1], "items": items[safe_offset:safe_offset + safe_limit], "count": len(items), "offset": safe_offset, "limit": safe_limit, "has_more": safe_offset + safe_limit < len(items), "source": "stored_scan"}
+
+
+def read_code_inventory_source(
+    project_id: str, relative_path: str, start_line: int = 1,
+    end_line: int | None = None, commit_hash: str | None = None,
+) -> dict | None:
+    """从指定 Commit 快照读取未入符号索引的文本文件。"""
+    with connection() as conn:
+        if commit_hash:
+            row = conn.execute(
+                "SELECT root_path, commit_hash, scan_metadata FROM code_project_snapshots WHERE project_id = %s AND commit_hash = %s",
+                (project_id, commit_hash),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT root_path, current_commit, scan_metadata FROM code_projects WHERE project_id = %s", (project_id,)
+            ).fetchone()
+    if not row:
+        return None
+    inventory = row[2].get("file_inventory", []) if isinstance(row[2], dict) else []
+    inventory_item = next((item for item in inventory if item.get("path") == relative_path), None)
+    if not inventory_item:
+        return None
+    root = Path(row[0]).expanduser().resolve()
+    target = (root / Path(relative_path)).resolve()
+    if target != root and root not in target.parents or not target.is_file():
+        return None
+    if target.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("source file is larger than 2 MB")
+    text = target.read_text(encoding="utf-8", errors="replace")
+    expected_hash = inventory_item.get("content_hash")
+    if not expected_hash or _hash_text(text) != expected_hash:
+        raise RuntimeError("source snapshot integrity check failed")
+    lines = text.splitlines()
+    first = max(1, start_line)
+    last = min(len(lines), end_line if end_line is not None else first + 119, first + 199)
+    if first > max(1, len(lines)) or last < first:
+        raise ValueError("source line range is outside the file")
+    return {"project_id": project_id, "commit_hash": row[1], "path": relative_path, "start_line": first, "end_line": last, "numbered_content": "\n".join(f"{line_no:>6}  {line}" for line_no, line in enumerate(lines[first - 1:last], first))}
+
+
 def search_code_symbols(
     project_id: str,
     query: str = "",
     limit: int = 100,
     file_path: str | None = None,
     symbol_kind: str | None = None,
+    commit_hash: str | None = None,
 ) -> list[dict]:
-    """搜索当前 Commit 的符号；空 query 用于页面按文件浏览，不跨历史版本混排。"""
+    """搜索指定 Commit 的符号；未指定时供页面浏览当前版本。"""
     with connection() as conn:
         result = conn.execute(
             """SELECT s.symbol_id, s.name, s.qualified_name, s.symbol_kind, f.path,
                       s.start_line, s.end_line, s.signature, s.metadata
                FROM code_projects p
-               JOIN code_symbols s ON s.project_id = p.project_id AND s.commit_hash = p.current_commit
+               JOIN code_symbols s ON s.project_id = p.project_id
+                    AND s.commit_hash = COALESCE(%s::text, p.current_commit)
                JOIN code_files f ON f.file_id = s.file_id
                WHERE p.project_id = %s
                  AND (%s = '' OR s.name ILIKE %s OR s.qualified_name ILIKE %s OR f.path ILIKE %s)
@@ -1123,7 +2327,7 @@ def search_code_symbols(
                ORDER BY CASE WHEN lower(s.name) = lower(%s) THEN 0 ELSE 1 END,
                         f.path, s.start_line, length(s.qualified_name) LIMIT %s""",
             (
-                project_id, query, f"%{query}%", f"%{query}%", f"%{query}%",
+                commit_hash, project_id, query, f"%{query}%", f"%{query}%", f"%{query}%",
                 file_path, file_path, symbol_kind, symbol_kind, query, limit,
             ),
         )
@@ -1182,3 +2386,174 @@ def get_code_symbol(symbol_id: str) -> dict | None:
                 for row in incoming_relations
             ],
         }
+
+
+def read_code_source(
+    project_id: str,
+    relative_path: str,
+    start_line: int = 1,
+    end_line: int | None = None,
+    commit_hash: str | None = None,
+) -> dict | None:
+    """读取指定 Commit 的受限源码，并校验快照内容哈希。"""
+    with connection() as conn:
+        if commit_hash:
+            row = conn.execute(
+                """SELECT s.root_path, s.commit_hash, f.path, f.content_hash, f.line_count
+                   FROM code_project_snapshots s
+                   JOIN code_files f ON f.project_id = s.project_id AND f.commit_hash = s.commit_hash
+                   WHERE s.project_id = %s AND s.commit_hash = %s AND f.path = %s""",
+                (project_id, commit_hash, relative_path),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT p.root_path, p.current_commit, f.path, f.content_hash, f.line_count
+                   FROM code_projects p
+                   JOIN code_files f ON f.project_id = p.project_id AND f.commit_hash = p.current_commit
+                   WHERE p.project_id = %s AND f.path = %s""",
+                (project_id, relative_path),
+            ).fetchone()
+    if not row:
+        return None
+
+    root = Path(row[0]).expanduser().resolve()
+    target = (root / Path(row[2])).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("source path escapes project root")
+    if not target.is_file():
+        raise FileNotFoundError("source file no longer exists")
+    if target.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("source file is larger than 2 MB")
+
+    text = target.read_text(encoding="utf-8", errors="replace")
+    if _hash_text(text) != row[3]:
+        # 返回内容和索引哈希不一致会制造无法复核的引用，因此直接中止本次取证。
+        raise RuntimeError("source snapshot integrity check failed")
+    lines = text.splitlines()
+    first = max(1, start_line)
+    last = min(len(lines), end_line if end_line is not None else first + 119, first + 199)
+    if first > max(1, len(lines)) or last < first:
+        raise ValueError("source line range is outside the file")
+    selected = lines[first - 1:last]
+    return {
+        "project_id": project_id,
+        "commit_hash": row[1],
+        "path": row[2],
+        "start_line": first,
+        "end_line": last,
+        "line_count": row[4],
+        "content": "\n".join(selected),
+        "numbered_content": "\n".join(f"{line_no:>6}  {line}" for line_no, line in enumerate(selected, first)),
+        "stale": False,
+    }
+
+
+def trace_code_call_chain(
+    symbol_id: str, max_depth: int = 4, max_nodes: int = 80,
+    commit_hash: str | None = None,
+) -> dict | None:
+    """从指定 Commit 的符号沿 calls 边做有界 BFS。"""
+    with connection() as conn:
+        start = conn.execute(
+            """SELECT s.symbol_id, s.project_id, s.commit_hash, s.name, s.qualified_name,
+                      s.symbol_kind, f.path, s.start_line, s.end_line
+               FROM code_symbols s
+               JOIN code_files f ON f.file_id = s.file_id
+               WHERE s.symbol_id = %s AND (%s::text IS NULL OR s.commit_hash = %s::text)""",
+            (symbol_id, commit_hash, commit_hash),
+        ).fetchone()
+        if not start:
+            return None
+
+        project_id, commit_hash = str(start[1]), start[2]
+
+        def node_from_row(row, depth: int) -> dict:
+            return {
+                "symbol_id": str(row[0]), "name": row[3], "qualified_name": row[4],
+                "symbol_kind": row[5], "path": row[6], "start_line": row[7],
+                "end_line": row[8], "depth": depth, "architecture_facts": [],
+            }
+
+        nodes = {str(start[0]): node_from_row(start, 0)}
+        queue: list[tuple[str, int, frozenset[str]]] = [
+            (str(start[0]), 0, frozenset({str(start[0])}))
+        ]
+        edges: list[dict] = []
+        unresolved_edges: list[dict] = []
+        cycles: list[dict] = []
+        seen_edges: set[str] = set()
+        truncated = False
+
+        while queue:
+            source_id, depth, ancestors = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            relations = conn.execute(
+                """SELECT r.relation_id, r.target_ref, r.confidence, r.evidence,
+                          ts.symbol_id, ts.project_id, ts.commit_hash, ts.name, ts.qualified_name,
+                          ts.symbol_kind, tf.path, ts.start_line, ts.end_line
+                   FROM code_relations r
+                   LEFT JOIN code_symbols ts ON ts.symbol_id = r.target_symbol_id
+                   LEFT JOIN code_files tf ON tf.file_id = ts.file_id
+                   WHERE r.source_symbol_id = %s AND r.relation_type = 'calls'
+                   ORDER BY r.confidence DESC, r.target_ref""",
+                (source_id,),
+            ).fetchall()
+            for relation in relations:
+                relation_id = str(relation[0])
+                if relation_id in seen_edges:
+                    continue
+                seen_edges.add(relation_id)
+                edge = {
+                    "relation_id": relation_id, "source_symbol_id": source_id,
+                    "target_symbol_id": str(relation[4]) if relation[4] else None,
+                    "target_ref": relation[1], "confidence": relation[2],
+                    "evidence": relation[3], "depth": depth + 1,
+                }
+                if not relation[4]:
+                    unresolved_edges.append(edge)
+                    continue
+                target_id = str(relation[4])
+                edges.append(edge)
+                if target_id in ancestors:
+                    cycles.append(edge)
+                    continue
+                if target_id in nodes:
+                    # 多条分支汇聚到同一函数不是环路；节点只展开一次，但边仍保留。
+                    continue
+                if len(nodes) >= max_nodes:
+                    truncated = True
+                    continue
+                target_row = (
+                    relation[4], relation[5], relation[6], relation[7], relation[8],
+                    relation[9], relation[10], relation[11], relation[12],
+                )
+                nodes[target_id] = node_from_row(target_row, depth + 1)
+                queue.append((target_id, depth + 1, ancestors | {target_id}))
+
+        if nodes:
+            placeholders = ",".join(["%s"] * len(nodes))
+            facts = conn.execute(
+                f"""SELECT fact_id, fact_type, name, value, source_path, source_line,
+                            evidence, source_symbol_id, confidence
+                     FROM code_architecture_facts
+                     WHERE project_id = %s AND commit_hash = %s
+                       AND source_symbol_id IN ({placeholders})
+                     ORDER BY source_line, fact_type""",
+                (project_id, commit_hash, *nodes.keys()),
+            ).fetchall()
+            for fact in facts:
+                owner_id = str(fact[7])
+                if owner_id in nodes:
+                    nodes[owner_id]["architecture_facts"].append({
+                        "fact_id": str(fact[0]), "fact_type": fact[1], "name": fact[2],
+                        "value": fact[3], "source_path": fact[4], "source_line": fact[5],
+                        "evidence": fact[6], "confidence": fact[8],
+                    })
+
+    return {
+        "project_id": project_id, "commit_hash": commit_hash, "root_symbol_id": str(start[0]),
+        "max_depth": max_depth, "max_nodes": max_nodes, "truncated": truncated,
+        "nodes": sorted(nodes.values(), key=lambda item: (item["depth"], item["path"], item["start_line"])),
+        "edges": edges, "unresolved_edges": unresolved_edges, "cycles": cycles,
+    }

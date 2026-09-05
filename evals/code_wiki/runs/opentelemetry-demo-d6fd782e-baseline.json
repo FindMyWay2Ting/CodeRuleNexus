@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "run_kind": "observed_scanner_baseline",
+  "recorded_at": "2026-08-29T09:54:13Z",
+  "project": {
+    "project_id": "56bd8175-b6ec-557e-b807-a9ce89662c60",
+    "name": "open-telemetry__opentelemetry-demo",
+    "source_url": "https://github.com/open-telemetry/opentelemetry-demo",
+    "commit": "d6fd782ee9ceedaec4a1c1f81017e8617d063240",
+    "commit_date": "2026-08-27T09:56:19Z",
+    "commit_subject": "chore(deps): bump go.opentelemetry.io/contrib to v1.46.0 line in checkout and product-catalog (#3902)"
+  },
+  "scanner_counts": {
+    "files": 190,
+    "symbols": 1115,
+    "relations": 5209,
+    "architecture_facts": 162,
+    "architecture_facts_linked_to_symbol": 38
+  },
+  "file_languages": {
+    "python": 23,
+    "go": 9,
+    "java": 4,
+    "javascript": 15,
+    "typescript": 139
+  },
+  "symbol_kinds": {
+    "class": 193,
+    "field": 101,
+    "file": 190,
+    "function": 575,
+    "method": 30,
+    "package": 8,
+    "struct": 3,
+    "type": 15
+  },
+  "relation_types": {
+    "calls": 1595,
+    "implements": 12,
+    "imports": 566,
+    "references": 3036
+  },
+  "architecture_fact_types": {
+    "component": {"total": 42, "linked_to_symbol": 23},
+    "downstream_grpc": {"total": 12, "linked_to_symbol": 1},
+    "downstream_http": {"total": 48, "linked_to_symbol": 0},
+    "entrypoint": {"total": 10, "linked_to_symbol": 6},
+    "kafka_cluster": {"total": 1, "linked_to_symbol": 0},
+    "kafka_topic_config": {"total": 1, "linked_to_symbol": 0},
+    "module": {"total": 16, "linked_to_symbol": 8},
+    "rpc_method": {"total": 21, "linked_to_symbol": 0},
+    "rpc_service": {"total": 11, "linked_to_symbol": 0}
+  },
+  "aggregated_components": [
+    {"name": "Docker", "category": "deployment", "confidence": 0.99},
+    {"name": "FastAPI", "category": "web_framework", "confidence": 0.99},
+    {"name": "PostgreSQL", "category": "database", "confidence": 0.85},
+    {"name": "SSE", "category": "transport", "confidence": 0.99}
+  ],
+  "scip": {
+    "go": {
+      "status": "succeeded",
+      "modules_succeeded": 4,
+      "modules_failed": 0,
+      "module_roots": [
+        "internal/tools",
+        "src/checkout",
+        "src/load-generator/xk6-otel",
+        "src/product-catalog"
+      ]
+    },
+    "python": {
+      "status": "installed_but_unavailable",
+      "node_version": "v20.20.2"
+    }
+  },
+  "baseline_observations": [
+    "Ground Truth is not complete; Precision, Recall and F1 are intentionally omitted.",
+    "Only 38 of 162 architecture facts are linked to a source symbol.",
+    "All 48 downstream_http facts are unlinked and require independent evidence review.",
+    "The SSE component is suspected to include false positives from generic event fields and test telemetry.",
+    "Security metadata URLs, alert runbook URLs and observability endpoints appear among downstream_http candidates and must not automatically become business-service dependencies.",
+    "The repository is polyglot; current symbol coverage does not represent unsupported language semantics uniformly."
+  ],
+  "evaluation_status": {
+    "ground_truth_complete": false,
+    "metrics_publishable": false,
+    "holdout_tuning_allowed": false
+  }
+}

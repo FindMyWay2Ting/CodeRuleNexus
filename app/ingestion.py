@@ -12,7 +12,7 @@ try:
 except ImportError:  # PDF 表格能力是可选依赖，缺失时仍保留普通 PDF 文本导入。
     pdfplumber = None
 
-from .db import ensure_document, find_reusable_document, insert_chunks
+from .db import connection, ensure_document, find_reusable_document, insert_chunks
 from .config import settings
 from .llm import embed
 
@@ -442,25 +442,31 @@ def document_metadata(
     department_id: str | None = None,
     project_name: str | None = None,
     workspace_name: str | None = None,
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+    display_name: str | None = None,
+    source_path: str | None = None,
 ) -> dict:
-    """生成文档级元数据；标题取文件名，作者暂时固定为 User。"""
+    """生成文档级元数据；作者和归属来自认证身份，不接受浏览器 user_id。"""
     digest = sha256(path.read_bytes()).hexdigest()
     return {
         "source_type": source_type,
+        "workspace_id": workspace_id or settings.workspace_id,
         "title": path.name,
         "source_name": path.name,
-        "source_path": str(path),
+        "source_path": source_path or str(path),
         "project_name": project_name if source_type == "wiki" else None,
         "workspace_name": (workspace_name or settings.current_workspace_name) if scope_type == "workspace" else None,
-        "author": "User",
+        "author": display_name or "User",
         "scope_type": scope_type,
-        "owner_user_id": settings.current_user_id if scope_type == "personal" else None,
+        "owner_user_id": (user_id or settings.current_user_id) if scope_type == "personal" else None,
+        "created_by_user_id": user_id or settings.current_user_id,
         "owner_department_id": department_id if scope_type == "department" else None,
         "content_hash": digest,
     }
 
 
-def build_rows(path: Path, source_type: str) -> list[dict]:
+def build_rows(path: Path, source_type: str, workspace_id: str | None = None, source_path: str | None = None) -> list[dict]:
     """先生成结构化父块，再切出子块；只有子块调用 Embedding API。"""
     content = read_file(path)
     # 父块按较大的结构单元生成；子块使用更短窗口承担向量召回。
@@ -475,6 +481,7 @@ def build_rows(path: Path, source_type: str) -> list[dict]:
         ".java": "java",
     }.get(suffix)
     rows: list[dict] = []
+    workspace_id = workspace_id or settings.workspace_id
     for parent_index, (parent_text, ref) in enumerate(structured_units):
         # split_document 已按标题、页码、表格或代码定义形成结构单元；每个单元是一个可解释父块。
         parent_id = str(uuid.uuid4())
@@ -493,8 +500,9 @@ def build_rows(path: Path, source_type: str) -> list[dict]:
                 "parent_key": parent_id,
                 "chunk_level": "parent",
                 "source_type": source_type,
+                "workspace_id": workspace_id,
                 "source_name": path.name,
-                "source_path": str(path),
+                "source_path": source_path or str(path),
                 "source_ref": f"{path.name}#{ref}#parent",
                 "chunk_index": parent_index,
                 "content": parent_text,
@@ -514,8 +522,9 @@ def build_rows(path: Path, source_type: str) -> list[dict]:
                     "parent_key": parent_id,
                     "chunk_level": "child",
                     "source_type": source_type,
+                    "workspace_id": workspace_id,
                     "source_name": path.name,
-                    "source_path": str(path),
+                    "source_path": source_path or str(path),
                     "source_ref": f"{path.name}#{ref}#child-{child_index + 1}",
                     "chunk_index": parent_index,
                     "child_index": child_index,
@@ -539,29 +548,25 @@ def ingest_file(
     department_id: str | None = None,
     project_name: str | None = None,
     workspace_name: str | None = None,
+    workspace_id: str | None = None,
     **metadata_overrides: str | None,
 ) -> tuple[str, int]:
     """完成单文件导入：先向量化，成功后再提交文档元数据和分块。"""
-    metadata = document_metadata(path, source_type, scope_type, department_id, project_name, workspace_name)
+    metadata = document_metadata(
+        path, source_type, scope_type, department_id, project_name, workspace_name, workspace_id,
+        metadata_overrides.get("user_id"), metadata_overrides.get("display_name"),
+        metadata_overrides.get("source_path"),
+    )
     reusable_id = find_reusable_document(metadata)
     if reusable_id:
         return reusable_id, 0
 
     # 外部 Embedding 失败时，此时数据库还没有新增或更新文档，避免出现半成功记录。
-    rows = build_rows(path, source_type)
-    document_id, created, revision_no = ensure_document(metadata)
-    if not created:
-        return document_id, 0
-    count = insert_chunks(rows, document_id)
+    rows = build_rows(path, source_type, workspace_id, metadata.get("source_path"))
+    # 元数据修订、旧 Chunk 删除和新 Chunk 写入共享一个事务；任何插入失败都会完整回滚。
+    with connection():
+        document_id, created, revision_no = ensure_document(metadata)
+        if not created:
+            return document_id, 0
+        count = insert_chunks(rows, document_id)
     return document_id, count
-
-
-def ingest_path(path: Path, source_type: str) -> int:
-    """扫描单个文件或目录中的支持类型文件，并返回新增分块数量。"""
-    if path.is_file():
-        return ingest_file(path, source_type, "workspace")[1]
-    count = 0
-    for file_path in path.rglob("*"):
-        if file_path.is_file() and (file_path.suffix.lower() in TEXT_EXTENSIONS or file_path.name == "Dockerfile"):
-            count += ingest_file(file_path, source_type, "workspace")[1]
-    return count

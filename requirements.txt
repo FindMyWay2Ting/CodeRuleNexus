@@ -12,3 +12,5 @@ tree-sitter==0.25.2
 tree-sitter-python==0.25.0
 tree-sitter-go==0.25.0
 protobuf==5.29.5
+PyYAML==6.0.2
+pwdlib[argon2]==0.2.1

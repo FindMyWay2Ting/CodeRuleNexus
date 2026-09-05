@@ -22,12 +22,29 @@ class Settings:
     reranker_api_key: str = os.getenv("RERANKER_API_KEY", "")
     reranker_model: str = os.getenv("RERANKER_MODEL", "qwen3-rerank")
     reranker_candidate_limit: int = int(os.getenv("RERANKER_CANDIDATE_LIMIT", "20"))
+    # Agent 自主决定何时结束；轮次和工具数只是防止异常循环的运行时安全预算。
+    code_agent_max_rounds: int = max(1, int(os.getenv("CODE_AGENT_MAX_ROUNDS", "10")))
+    code_agent_max_tool_calls: int = max(1, int(os.getenv("CODE_AGENT_MAX_TOOL_CALLS", "12")))
+    # Python SCIP 在 Windows 上通过 Linux 容器运行，避免官方 CLI 的路径正则兼容问题。
+    scip_python_image: str = os.getenv("SCIP_PYTHON_IMAGE", "sourcegraph/scip-python:v0.6.6")
+    scip_python_timeout: int = int(os.getenv("SCIP_PYTHON_TIMEOUT", "300"))
     workspace_id: str = os.getenv("WORKSPACE_ID", "workspace-001")
     # 当前工作空间显示名称；MVP 阶段默认沿用工作空间 ID，后续可接入工作空间表。
     current_workspace_name: str = os.getenv("CURRENT_WORKSPACE_NAME", "workspace-001")
-    # 当前还没有认证，先用服务端配置模拟当前用户和部门；不能信任浏览器上传的 user_id。
+    # 仅用于旧数据库迁移占位身份；HTTP 请求身份始终来自可撤销 Session。
     current_user_id: str = os.getenv("CURRENT_USER_ID", "User")
     current_department_id: str = os.getenv("CURRENT_DEPARTMENT_ID", "department-001")
+    # 浏览器只保存不可读的随机 Session Cookie；生产 HTTPS 部署必须设为 true。
+    session_cookie_name: str = os.getenv("SESSION_COOKIE_NAME", "knowledge_session")
+    csrf_cookie_name: str = os.getenv("CSRF_COOKIE_NAME", "knowledge_csrf")
+    session_cookie_secure: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+    session_absolute_hours: int = int(os.getenv("SESSION_ABSOLUTE_HOURS", "168"))
+    session_idle_minutes: int = int(os.getenv("SESSION_IDLE_MINUTES", "720"))
+    registration_enabled: bool = os.getenv("REGISTRATION_ENABLED", "true").lower() == "true"
+    # 旧单用户数据只能凭一次性接管码认领；留空表示彻底关闭旧数据接管。
+    legacy_bootstrap_token: str = os.getenv("LEGACY_BOOTSTRAP_TOKEN", "")
+    # 多用户 HTTP 服务不接受任意服务器路径；本地管理员确有需要时才能显式开启。
+    allow_server_path_scan: bool = os.getenv("ALLOW_SERVER_PATH_SCAN", "false").lower() == "true"
     max_context_chunks: int = int(os.getenv("MAX_CONTEXT_CHUNKS", "8"))
     # 父块保存较完整的章节/页面/代码定义；子块更短，只对子块生成向量并参与召回。
     parent_chunk_size: int = int(os.getenv("PARENT_CHUNK_SIZE", "2400"))

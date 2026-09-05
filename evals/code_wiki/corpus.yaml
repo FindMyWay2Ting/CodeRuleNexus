@@ -1,0 +1,25 @@
+version: 1
+updated_at: "2026-08-29T09:54:13Z"
+
+repositories:
+  - id: opentelemetry-demo
+    role: holdout
+    source_url: https://github.com/open-telemetry/opentelemetry-demo
+    commit: d6fd782ee9ceedaec4a1c1f81017e8617d063240
+    commit_date: "2026-08-27T09:56:19Z"
+    license: Apache-2.0
+    managed_path: data/code_repositories/open-telemetry__opentelemetry-demo
+    baseline_run: runs/opentelemetry-demo-d6fd782e-baseline.json
+    ground_truth:
+      status: pending_manual_annotation
+      sources:
+        - compose.yaml
+        - compose.full.yaml
+        - compose.observability.yaml
+        - .env
+        - pb/demo.proto
+        - https://opentelemetry.io/docs/demo/architecture/
+    policy:
+      tune_scanner_from_this_repository: false
+      metrics_publishable: false
+

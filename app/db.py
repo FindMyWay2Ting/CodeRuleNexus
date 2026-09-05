@@ -3,6 +3,7 @@ import re
 import uuid
 import math
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Iterator
 
 import psycopg
@@ -10,10 +11,18 @@ import psycopg
 from .config import settings
 
 
+_transaction_connection: ContextVar[psycopg.Connection | None] = ContextVar("db_transaction", default=None)
+
+
 @contextmanager
 def connection() -> Iterator[psycopg.Connection]:
-    """提供一个自动提交/回滚/关闭的数据库连接。"""
+    """提供可嵌套事务；内层仓储调用复用外层连接，不会提前提交。"""
+    active = _transaction_connection.get()
+    if active is not None:
+        yield active
+        return
     conn = psycopg.connect(settings.database_url)
+    context_token = _transaction_connection.set(conn)
     try:
         yield conn
         conn.commit()
@@ -21,6 +30,7 @@ def connection() -> Iterator[psycopg.Connection]:
         conn.rollback()
         raise
     finally:
+        _transaction_connection.reset(context_token)
         conn.close()
 
 
@@ -70,6 +80,8 @@ def initialize() -> None:
                     CHECK (scope_type IN ('personal', 'department', 'workspace')),
                 -- 个人归属者；当前由服务端 CURRENT_USER_ID 提供。
                 owner_user_id TEXT,
+                -- 首次导入该文档的真实用户；共享文档也保留创建者。
+                created_by_user_id TEXT,
                 -- 部门归属标识；认证后应来自用户部门关系，而不是前端任意输入。
                 owner_department_id TEXT,
                 -- 首次创建文档记录的时间，也就是首次导入时间。
@@ -87,6 +99,7 @@ def initialize() -> None:
             "ALTER TABLE documents ADD COLUMN IF NOT EXISTS scope_type TEXT NOT NULL DEFAULT 'workspace'"
         )
         conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
+        conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS created_by_user_id TEXT")
         conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS owner_department_id TEXT")
         conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS project_name TEXT")
         conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS workspace_name TEXT")
@@ -128,7 +141,8 @@ def initialize() -> None:
             COMMENT ON COLUMN documents.invalid_reason IS '文档失效原因';
             COMMENT ON COLUMN documents.current_revision IS '当前自动修订号，从 1 开始';
             COMMENT ON COLUMN documents.scope_type IS '知识归属范围：personal、department 或 workspace';
-            COMMENT ON COLUMN documents.owner_user_id IS '个人归属者；当前认证未完成时由服务端配置提供';
+            COMMENT ON COLUMN documents.owner_user_id IS '个人知识归属者；由服务端认证身份写入';
+            COMMENT ON COLUMN documents.created_by_user_id IS '首次导入文档的用户；用于共享知识治理和审计';
             COMMENT ON COLUMN documents.owner_department_id IS '部门归属标识；后续由认证用户部门关系提供';
             COMMENT ON COLUMN documents.created_at IS '文档首次导入时间';
             COMMENT ON COLUMN documents.updated_at IS '文档元数据最后更新时间';
@@ -136,10 +150,16 @@ def initialize() -> None:
         )
         # 归属范围属于文档唯一性的一部分；同一内容可以分别归属于个人和部门。
         conn.execute("DROP INDEX IF EXISTS uq_documents_workspace_hash")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_workspace_hash_scope "
-            "ON documents (workspace_id, content_hash, scope_type, COALESCE(owner_user_id, ''), COALESCE(owner_department_id, ''))"
-        )
+        index_row = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'uq_documents_workspace_hash_scope'"
+        ).fetchone()
+        if not index_row or "created_by_user_id" not in index_row[0]:
+            conn.execute("DROP INDEX IF EXISTS uq_documents_workspace_hash_scope")
+            conn.execute(
+                "CREATE UNIQUE INDEX uq_documents_workspace_hash_scope "
+                "ON documents (workspace_id, content_hash, scope_type, COALESCE(owner_user_id, ''), "
+                "COALESCE(owner_department_id, ''), COALESCE(created_by_user_id, ''))"
+            )
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS knowledge_chunks (
@@ -351,6 +371,7 @@ def initialize() -> None:
 def ensure_document(metadata: dict) -> tuple[str, bool, int]:
     """登记文档修订：相同内容跳过，来源内容变化则递增修订号并清理旧分块。"""
     document_id = uuid.uuid4()
+    workspace_id = metadata.get("workspace_id") or settings.workspace_id
     with connection() as conn:
         existing_source = conn.execute(
             """
@@ -360,10 +381,12 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
               AND scope_type = %s
               AND owner_user_id IS NOT DISTINCT FROM %s
               AND owner_department_id IS NOT DISTINCT FROM %s
+              AND created_by_user_id IS NOT DISTINCT FROM %s
             """,
             (
-                settings.workspace_id, metadata["source_type"], metadata.get("source_path"),
+                workspace_id, metadata["source_type"], metadata.get("source_path"),
                 metadata["scope_type"], metadata.get("owner_user_id"), metadata.get("owner_department_id"),
+                metadata.get("created_by_user_id"),
             ),
         ).fetchone()
         if existing_source:
@@ -378,6 +401,7 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
                 SET title = %s, author = %s, content_hash = %s, current_revision = %s,
                     project_name = %s, workspace_name = %s,
                     scope_type = %s, owner_user_id = %s, owner_department_id = %s,
+                    created_by_user_id = COALESCE(created_by_user_id, %s),
                     status = 'active', invalidated_at = NULL, invalid_reason = NULL, updated_at = NOW()
                 WHERE document_id = %s
                 """,
@@ -385,6 +409,7 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
                     metadata["title"], metadata["author"], metadata["content_hash"], next_revision,
                     metadata.get("project_name"), metadata.get("workspace_name"),
                     metadata["scope_type"], metadata.get("owner_user_id"), metadata.get("owner_department_id"),
+                    metadata.get("created_by_user_id"),
                     existing_id,
                 ),
             )
@@ -406,10 +431,12 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
               AND scope_type = %s
               AND owner_user_id IS NOT DISTINCT FROM %s
               AND owner_department_id IS NOT DISTINCT FROM %s
+              AND created_by_user_id IS NOT DISTINCT FROM %s
             """,
             (
-                settings.workspace_id, metadata["content_hash"], metadata["scope_type"],
+                workspace_id, metadata["content_hash"], metadata["scope_type"],
                 metadata.get("owner_user_id"), metadata.get("owner_department_id"),
+                metadata.get("created_by_user_id"),
             ),
         ).fetchone()
         if existing_hash:
@@ -420,15 +447,16 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
             INSERT INTO documents
             (document_id, workspace_id, source_type, title, source_name, source_path,
              project_name, workspace_name, category, author, version, content_hash, current_revision,
-             scope_type, owner_user_id, owner_department_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, 1, %s, %s, %s)
+             scope_type, owner_user_id, owner_department_id, created_by_user_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, 1, %s, %s, %s, %s)
             RETURNING document_id
             """,
             (
-                document_id, settings.workspace_id, metadata["source_type"], metadata["title"],
+                document_id, workspace_id, metadata["source_type"], metadata["title"],
                 metadata["source_name"], metadata.get("source_path"), metadata.get("project_name"),
                 metadata.get("workspace_name"), metadata["author"], metadata["content_hash"],
                 metadata["scope_type"], metadata.get("owner_user_id"), metadata.get("owner_department_id"),
+                metadata.get("created_by_user_id"),
             ),
         )
         new_id = result.fetchone()[0]
@@ -445,6 +473,7 @@ def ensure_document(metadata: dict) -> tuple[str, bool, int]:
 
 def find_reusable_document(metadata: dict) -> str | None:
     """在调用 Embedding 前检查幂等数据，避免重复导入时再次请求外部模型。"""
+    workspace_id = metadata.get("workspace_id") or settings.workspace_id
     with connection() as conn:
         existing_source = conn.execute(
             """
@@ -457,15 +486,17 @@ def find_reusable_document(metadata: dict) -> str | None:
               AND scope_type = %s
               AND owner_user_id IS NOT DISTINCT FROM %s
               AND owner_department_id IS NOT DISTINCT FROM %s
+              AND created_by_user_id IS NOT DISTINCT FROM %s
             """,
             (
-                settings.workspace_id,
+                workspace_id,
                 metadata["source_type"],
                 metadata.get("source_path"),
                 metadata["content_hash"],
                 metadata["scope_type"],
                 metadata.get("owner_user_id"),
                 metadata.get("owner_department_id"),
+                metadata.get("created_by_user_id"),
             ),
         ).fetchone()
         if existing_source:
@@ -480,10 +511,12 @@ def find_reusable_document(metadata: dict) -> str | None:
               AND scope_type = %s
               AND owner_user_id IS NOT DISTINCT FROM %s
               AND owner_department_id IS NOT DISTINCT FROM %s
+              AND created_by_user_id IS NOT DISTINCT FROM %s
             """,
             (
-                settings.workspace_id, metadata["content_hash"], metadata["scope_type"],
+                workspace_id, metadata["content_hash"], metadata["scope_type"],
                 metadata.get("owner_user_id"), metadata.get("owner_department_id"),
+                metadata.get("created_by_user_id"),
             ),
         ).fetchone()
         return str(existing_hash[0]) if existing_hash else None
@@ -510,7 +543,7 @@ def insert_chunks(rows: list[dict], document_id: str) -> int:
                 VALUES (%s, NULL, 'parent', %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, NULL)
                 """,
                 (
-                    chunk_id, document_id, settings.workspace_id, row["source_type"], row["source_name"],
+                    chunk_id, document_id, row.get("workspace_id", settings.workspace_id), row["source_type"], row["source_name"],
                     row.get("source_path"), row.get("source_ref"), row["chunk_index"], row.get("element_type", "document"),
                     row.get("section_path"), row.get("page_number"), row.get("language"), row.get("code_symbol"),
                     len(row["content"]), json.dumps(row.get("metadata", {}), ensure_ascii=False), row["content"],
@@ -530,7 +563,7 @@ def insert_chunks(rows: list[dict], document_id: str) -> int:
                 """,
                 (
                     row["chunk_id"], parent_id, document_id,
-                    settings.workspace_id,
+                    row.get("workspace_id", settings.workspace_id),
                     row["source_type"],
                     row["source_name"],
                     row.get("source_path"),
@@ -565,8 +598,10 @@ def search_chunks(
     limit: int,
     user_id: str | None = None,
     department_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict]:
     """在 workspace、知识类型和当前用户可见归属范围内做余弦检索。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         result = conn.execute(
             """
@@ -575,7 +610,7 @@ def search_chunks(
                    c.element_type, c.section_path, c.page_number, c.language, c.code_symbol,
                    c.content, 1 - (embedding <=> %s::vector) AS score
             FROM knowledge_chunks c
-            JOIN documents d ON d.document_id = c.document_id
+            JOIN documents d ON d.document_id = c.document_id AND d.workspace_id = c.workspace_id
             WHERE c.workspace_id = %s AND c.source_type = ANY(%s)
               AND c.chunk_level = 'child' AND c.embedding IS NOT NULL
               AND d.status = 'active'
@@ -586,7 +621,7 @@ def search_chunks(
             LIMIT %s
             """,
             (
-                json.dumps(query_embedding), settings.workspace_id, source_types,
+                json.dumps(query_embedding), workspace_id, source_types,
                 user_id, department_id, json.dumps(query_embedding), limit,
             ),
         )
@@ -600,11 +635,13 @@ def search_keyword_chunks(
     limit: int,
     user_id: str | None = None,
     department_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict]:
     """使用查询词片段做 pg_trgm 词面召回，避免长中文问题稀释关键词相似度。"""
     terms = _keyword_terms(query)
     if not terms:
         return []
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         result = conn.execute(
             """
@@ -613,7 +650,7 @@ def search_keyword_chunks(
                    c.element_type, c.section_path, c.page_number, c.language, c.code_symbol,
                    c.content, MAX(similarity(c.content, term.value)) AS keyword_score
             FROM knowledge_chunks c
-            JOIN documents d ON d.document_id = c.document_id
+            JOIN documents d ON d.document_id = c.document_id AND d.workspace_id = c.workspace_id
             CROSS JOIN LATERAL unnest(%s::text[]) AS term(value)
             WHERE c.workspace_id = %s AND c.source_type = ANY(%s)
               AND c.chunk_level = 'child' AND c.embedding IS NOT NULL
@@ -628,7 +665,7 @@ def search_keyword_chunks(
             ORDER BY MAX(similarity(c.content, term.value)) DESC
             LIMIT %s
             """,
-            (terms, settings.workspace_id, source_types, user_id, department_id, limit),
+            (terms, workspace_id, source_types, user_id, department_id, limit),
         )
         columns = [desc.name for desc in result.description]
         return [dict(zip(columns, row)) for row in result.fetchall()]
@@ -654,10 +691,11 @@ def hybrid_search(
     limit: int,
     user_id: str | None = None,
     department_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict]:
     """融合向量和词面两路召回，并在两路召回前统一应用归属过滤。"""
-    vector_results = search_chunks(query_embedding, source_types, limit, user_id, department_id)
-    keyword_results = search_keyword_chunks(query, source_types, limit, user_id, department_id)
+    vector_results = search_chunks(query_embedding, source_types, limit, user_id, department_id, workspace_id)
+    keyword_results = search_keyword_chunks(query, source_types, limit, user_id, department_id, workspace_id)
 
     # Reciprocal Rank Fusion 只使用名次，不直接混合余弦分数和 trigram 分数。
     rrf_k = 60
@@ -691,10 +729,19 @@ def _estimate_tokens(text: str) -> int:
     return max(1, math.ceil(len(text.strip()) / 2))
 
 
-def expand_context(results: list[dict], max_tokens: int) -> list[dict]:
+def expand_context(
+    results: list[dict],
+    max_tokens: int,
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+    department_id: str | None = None,
+) -> list[dict]:
     """将命中的子块扩展为父块上下文，并去重、按预算保留高相关证据。"""
     if not results or max_tokens <= 0:
         return []
+    workspace_id = workspace_id or settings.workspace_id
+    user_id = user_id or settings.current_user_id
+    department_id = department_id or settings.current_department_id
     parent_ids = [str(item["parent_chunk_id"]) for item in results if item.get("parent_chunk_id")]
     parents: dict[str, dict] = {}
     if parent_ids:
@@ -705,12 +752,13 @@ def expand_context(results: list[dict], max_tokens: int) -> list[dict]:
                        c.source_ref, c.chunk_index, c.element_type, c.section_path,
                        c.page_number, c.language, c.code_symbol, c.content
                 FROM knowledge_chunks c
-                JOIN documents d ON d.document_id = c.document_id
+                JOIN documents d ON d.document_id = c.document_id AND d.workspace_id = c.workspace_id
                 WHERE c.chunk_id = ANY(%s::uuid[])
+                  AND c.workspace_id = %s
                   AND c.chunk_level = 'parent' AND d.status = 'active'
                 """
                 + _visibility_clause(),
-                (parent_ids, settings.current_user_id, settings.current_department_id),
+                (parent_ids, workspace_id, user_id, department_id),
             )
             columns = [desc.name for desc in parent_result.description]
             parents = {str(row[0]): dict(zip(columns, row)) for row in parent_result.fetchall()}
@@ -765,10 +813,12 @@ def list_knowledge(
     scope_type: str | None = None,
     user_id: str | None = None,
     department_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict]:
     """按文档聚合列表，供知识管理页面展示导入时间和分块数量。"""
+    workspace_id = workspace_id or settings.workspace_id
     conditions = ["workspace_id = %s"]
-    params: list = [settings.workspace_id]
+    params: list = [workspace_id]
     if source_type is not None:
         conditions.append("source_type = %s")
         params.append(source_type)
@@ -796,8 +846,9 @@ def list_knowledge(
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
-def list_document_revisions(document_id: str) -> list[dict]:
+def list_document_revisions(document_id: str, workspace_id: str | None = None) -> list[dict]:
     """按文档返回修订历史，供知识管理页面展示版本和更新记录。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         result = conn.execute(
             """
@@ -812,14 +863,15 @@ def list_document_revisions(document_id: str) -> list[dict]:
               )
             ORDER BY revision_no DESC
             """,
-            (document_id, document_id, settings.workspace_id),
+            (document_id, document_id, workspace_id),
         )
         columns = [desc.name for desc in result.description]
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
-def invalidate_document(document_id: str, reason: str | None = None) -> bool:
+def invalidate_document(document_id: str, reason: str | None = None, workspace_id: str | None = None) -> bool:
     """保留文档和分块，但将其标记为 invalid，使检索自动忽略。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         result = conn.execute(
             """
@@ -828,13 +880,14 @@ def invalidate_document(document_id: str, reason: str | None = None) -> bool:
             WHERE document_id = %s AND workspace_id = %s AND status = 'active'
             RETURNING document_id
             """,
-            (reason, document_id, settings.workspace_id),
+            (reason, document_id, workspace_id),
         )
         return result.fetchone() is not None
 
 
-def restore_document(document_id: str) -> bool:
+def restore_document(document_id: str, workspace_id: str | None = None) -> bool:
     """恢复失效文档；关联分块重新允许进入向量检索。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         result = conn.execute(
             """
@@ -843,20 +896,21 @@ def restore_document(document_id: str) -> bool:
             WHERE document_id = %s AND workspace_id = %s AND status = 'invalid'
             RETURNING document_id
             """,
-            (document_id, settings.workspace_id),
+            (document_id, workspace_id),
         )
         return result.fetchone() is not None
 
 
-def delete_document(document_id: str) -> bool:
+def delete_document(document_id: str, workspace_id: str | None = None) -> bool:
     """永久删除文档及其分块；调用方必须在用户界面进行二次确认。"""
+    workspace_id = workspace_id or settings.workspace_id
     with connection() as conn:
         exists = conn.execute(
             "SELECT document_id FROM documents WHERE document_id = %s AND workspace_id = %s",
-            (document_id, settings.workspace_id),
+            (document_id, workspace_id),
         ).fetchone()
         if not exists:
             return False
         conn.execute("DELETE FROM knowledge_chunks WHERE document_id = %s", (document_id,))
-        conn.execute("DELETE FROM documents WHERE document_id = %s AND workspace_id = %s", (document_id, settings.workspace_id))
+        conn.execute("DELETE FROM documents WHERE document_id = %s AND workspace_id = %s", (document_id, workspace_id))
         return True
