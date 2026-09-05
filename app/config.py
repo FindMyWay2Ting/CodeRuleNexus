@@ -23,8 +23,12 @@ class Settings:
     reranker_model: str = os.getenv("RERANKER_MODEL", "qwen3-rerank")
     reranker_candidate_limit: int = int(os.getenv("RERANKER_CANDIDATE_LIMIT", "20"))
     # Agent 自主决定何时结束；轮次和工具数只是防止异常循环的运行时安全预算。
-    code_agent_max_rounds: int = max(1, int(os.getenv("CODE_AGENT_MAX_ROUNDS", "10")))
-    code_agent_max_tool_calls: int = max(1, int(os.getenv("CODE_AGENT_MAX_TOOL_CALLS", "12")))
+    # 面试演示需要允许 Agent 充分调查；这里保留较高的异常熔断上限，
+    # 正常结束仍由 Agent 的 finish_investigation、重复调用和无新证据规则决定。
+    code_agent_max_rounds: int = max(1, int(os.getenv("CODE_AGENT_MAX_ROUNDS", "50")))
+    code_agent_max_tool_calls: int = max(1, int(os.getenv("CODE_AGENT_MAX_TOOL_CALLS", "100")))
+    knowledge_agent_max_rounds: int = max(1, int(os.getenv("KNOWLEDGE_AGENT_MAX_ROUNDS", "50")))
+    knowledge_agent_max_tool_calls: int = max(1, int(os.getenv("KNOWLEDGE_AGENT_MAX_TOOL_CALLS", "100")))
     # Python SCIP 在 Windows 上通过 Linux 容器运行，避免官方 CLI 的路径正则兼容问题。
     scip_python_image: str = os.getenv("SCIP_PYTHON_IMAGE", "sourcegraph/scip-python:v0.6.6")
     scip_python_timeout: int = int(os.getenv("SCIP_PYTHON_TIMEOUT", "300"))

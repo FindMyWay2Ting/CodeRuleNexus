@@ -2191,6 +2191,8 @@ async def agentic_knowledge_stream(
             message, project_id=project_id, cross_project_policy="candidate_set",
             allowed_project_ids=set(resolved_scope.allowed_project_ids),
             authorized_projects=list(resolved_scope.authorized_projects),
+            max_rounds=settings.knowledge_agent_max_rounds,
+            max_tool_calls=settings.knowledge_agent_max_tool_calls,
         )
         if capability_mode == "codewiki":
             state.set_scope("strict_project", "none")
