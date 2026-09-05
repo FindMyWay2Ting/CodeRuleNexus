@@ -47,27 +47,25 @@ def validate_answer_contract(
         return False, "unapproved_citation"
     if not required_ids.issubset(cited_ids):
         return False, "missing_required_citation"
-    remaining_claims = {(claim.text.strip(), frozenset(claim.evidence_ids)) for claim in claims}
-    for raw_line in answer_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        line_ids = frozenset(re.findall(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", line))
-        text = re.sub(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", "", line)
-        text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", text).strip()
-        text = text.rstrip("。；; ")
-        matched = next(
-            (
-                item for item in remaining_claims
-                if text == item[0].rstrip("。；; ") and line_ids == item[1]
-            ),
-            None,
-        )
-        if matched is None:
+    # 核心 Claim 必须原样出现在回答中，但允许模型在核心事实之外补充
+    # 解释、实现流程、调用链和 Mermaid 图。这样 Answer Gate 仍校验事实，
+    # 同时不会把最终回答压缩成几行无法用于面试或排障的短结论。
+    for claim in claims:
+        normalized_claim = re.sub(r"\s+", " ", claim.text.strip()).strip().rstrip("。；; ")
+        claim_found = False
+        for raw_line in answer_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line_ids = set(re.findall(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", line))
+            text = re.sub(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", "", line)
+            text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", text).strip()
+            text = re.sub(r"\s+", " ", text).rstrip("。；; ")
+            if text == normalized_claim and set(claim.evidence_ids).issubset(line_ids):
+                claim_found = True
+                break
+        if not claim_found:
             return False, "claim_text_or_mapping_changed"
-        remaining_claims.remove(matched)
-    if remaining_claims:
-        return False, "missing_approved_claim"
     return True, "validated"
 
 

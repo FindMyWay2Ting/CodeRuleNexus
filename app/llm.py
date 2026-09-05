@@ -240,11 +240,12 @@ def stream_answer(question: str, context: str, approved_claims: list[dict] | Non
     """流式生成最终回答；Agent 模式可传入已通过 Answer Gate 的 Claim 契约。"""
     claim_contract = json.dumps(approved_claims or [], ensure_ascii=False)
     contract_instruction = (
-        "Claim 契约是最终答案的机器可校验白名单。"
-        "必须逐条输出全部 Claim，每个 Claim 独占一行；可以在行首使用短横线，"
-        "但 Claim 文本必须原样保留，不得改写、合并、扩展或添加标题、前言和结语。"
-        "每行末尾必须原样输出该 Claim 的全部 evidence_ids，格式为 [证据编号]，"
-        "不得遗漏、调换到其他 Claim 或引用契约外编号。"
+        "Claim 契约是最终答案中必须保留的核心事实白名单。"
+        "先用‘核心结论’列出全部 Claim，Claim 文本必须原样保留，并在对应句子中保留全部 evidence_ids。"
+        "核心结论之后可以补充‘证据位置’、‘实现流程’、‘关键组件’、‘调用关系’和‘结论边界’，"
+        "但所有新增事实必须来自给定证据，并使用已批准的 evidence_ids。"
+        "如果证据能够支持调用流程，可以使用 Mermaid fenced code block（```mermaid）展示流程图；"
+        "不要为了凑长度重复工具调用过程，也不要把未被证据支持的推测写成事实。"
         if approved_claims else ""
     )
     stream = _client(settings.llm_api_base, settings.llm_api_key).chat.completions.create(
@@ -257,7 +258,9 @@ def stream_answer(question: str, context: str, approved_claims: list[dict] | Non
                 "role": "system",
                 "content": (
                     "你是企业知识库助手。只能依据提供的证据回答，不要编造。"
-                    "如果证据不足，明确说明无法确认。回答要简洁，并保留来源编号。"
+                    "回答需要完整组织证据，而不是只给一句结论：先说明结论，再说明证据位置、"
+                    "实现过程、组件职责、调用关系和未确认边界；有足够证据时给出结构化 Markdown。"
+                    "如果证据支持，可以用 Mermaid 展示流程或调用链。"
                     + contract_instruction
                 ),
             },
