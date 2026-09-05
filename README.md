@@ -107,7 +107,7 @@ Chat 回答支持 Markdown 展示，服务端会先清洗 HTML，再交给页面
 浏览器 Session Cookie 为 HttpOnly/SameSite，写请求需要 CSRF Cookie 与 Header 匹配。普通用户不能提交服务器绝对路径；项目应通过浏览器文件夹上传。只有明确设置 `ALLOW_SERVER_PATH_SCAN=true` 才会开放旧服务器路径接口。
 
 Code Wiki 的独立页面位于 `http://127.0.0.1:8000/#code-wiki`。页面支持输入公开 GitHub HTTPS 链接，或点击选择本机完整项目文件夹上传，随后展示 SCIP 状态、模块诊断和架构证据，并按“文件 -> 符号 -> 入站/出站关系”逐层查看可追溯代码事实。架构证据分为 Components、Resources 和 Downstream，点击条目可查看文件、行号和原始证据。托管副本由 `CODE_REPOSITORY_ROOT` 指定，默认位于 `data/code_repositories`；需要让同一数据库跨 checkout 或滚动版本继续读取既有快照时，应配置 checkout 外的绝对持久化路径。GitHub 与本地上传都先在 staging 扫描，再保存为按 Commit/内容哈希命名的不可变快照，并由数据库原子切换当前版本；同项目导入和删除由 PostgreSQL advisory lock 串行化。私有仓库认证暂未接入。
-
+![alt text](picture/代码wiki.png)
 Code Wiki 使用 Tree-sitter 解析 Python/Go 的结构，并以 SCIP 作为精确语义增强层。扫描 Go module 时会自动执行 `scip-go`、解析官方 Protobuf 索引，将定义、引用和实现关系合并进 `code_symbols/code_relations`；Python 通过临时 `sourcegraph/scip-python:v0.6.6` 容器生成索引，容器不可用时回退 Tree-sitter。模块级结果和索引哈希保存在 `code_projects.scan_metadata`。当前 Go SCIP 仍运行在宿主机，因此演示环境只应导入可信仓库；面向不可信代码开放前必须迁移到隔离 Worker 或受限容器。
 
 生成代码（例如 `*_pb2.py`、`*.pb.go`、`*.generated.ts`）默认不作为业务源码扫描。SCIP 失败不会清空 Tree-sitter 结果，接口会通过 `scip.go.status/modules` 返回 `succeeded`、`partial`、`failed` 或稳定跳过原因；原始 stderr 只写服务日志。
@@ -115,3 +115,6 @@ Code Wiki 使用 Tree-sitter 解析 Python/Go 的结构，并以 SCIP 作为精�
 一次 Code Agent 请求会固定启动时的 Commit。文件资产、配置事实、架构事实、符号、调用链和源码读取都按该 Commit 查询；源码或配置文件的内容哈希与扫描记录不一致时直接停止取证，不把 stale 内容交给模型。六类版本化事实表通过复合外键关联 `code_project_snapshots(project_id, commit_hash)`。
 
 架构扫描器当前使用确定性规则读取语言声明、路由、依赖、初始化代码和 YAML/TOML/ENV 配置，识别 Python/Go/JavaScript 模块、程序入口、FastAPI/Flask/Gin/Chi/Fiber/net/http 路由、Proto RPC、后台任务、生命周期，以及 Kafka、Mongo、Redis 和 HTTP/gRPC 下游。结果写入 `code_architecture_facts`，并保存 Commit、文件、行号、证据、置信度和可空的 `source_symbol_id`；页面可从架构事实跳转到对应符号的定义与关系。测试目录、示例、生成绑定和锁文件不进入生产架构摘要；密码、Token、API Key 和连接串凭据会在入库前脱敏。该层提供事实，不使用 LLM 猜测模块职责；配置目标到调用符号的关联、调用链聚合和 Wiki 页面生成仍属于后续能力。
+
+生成交接码，一键式将离职员工的工作空间转给新员工
+![alt text](picture/交接.png)
