@@ -101,7 +101,7 @@ RAG 上传时标题自动使用文件名，作者和创建者取当前登录身�
 Chat 回答支持 Markdown 展示，服务端会先清洗 HTML，再交给页面渲染。
 
 所有公开回答模式共享同一个顶层 Agent。`rag`、`codewiki` 和 `hybrid` 只限制可调用的证据能力；最终回答必须匹配 Answer Gate 批准的 Claim 与引用。模型正文先完整缓存并机械校验，校验失败时仅返回获批 Claim；公开调查事件、每个答案分片和最终 `done` 发送前都会重新验证当前 Session、空间成员、部门和项目 ACL。
-
+![alt text](picture/agent助手.png)
 当前 MVP 支持个人空间和团队空间。空间角色为 owner、admin、editor、viewer；所有 RAG、Code Wiki 和 Agent 请求都使用服务端 Session 身份解析空间与项目候选集合。每个新账号都会获得独立个人空间；旧 `CURRENT_USER_ID` 数据只有在 `.env` 配置 `LEGACY_BOOTSTRAP_TOKEN` 且注册时提交相同一次性接管码时才会被认领，来源 IP 不是接管凭据。生产部署应关闭自主注册并接企业 IdP。
 
 浏览器 Session Cookie 为 HttpOnly/SameSite，写请求需要 CSRF Cookie 与 Header 匹配。普通用户不能提交服务器绝对路径；项目应通过浏览器文件夹上传。只有明确设置 `ALLOW_SERVER_PATH_SCAN=true` 才会开放旧服务器路径接口。

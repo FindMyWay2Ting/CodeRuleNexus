@@ -1478,9 +1478,14 @@ async def _code_wiki_evidence_stream(request: CodeAgentRequest) -> StreamingResp
                 # Engine 统一处理重复请求、无进展、工具预算和轮次预算；主循环只消费状态转移。
                 transition = loop_state.evaluate_round(round_index, executed_calls, blocked_reasons)
                 if not transition.should_continue:
+                    stop_message = (
+                        "已停止继续搜索，正在基于已有证据组织回答"
+                        if citations.items
+                        else f"调查停止：{transition.reason}"
+                    )
                     yield _sse_event("step", {
                         "step": f"agent_round_{round_index + 1}", "status": "completed",
-                        "message": f"Loop Engine 已停止：{transition.reason}",
+                        "message": stop_message,
                         "metrics": {"tool_calls": transition.tool_calls, "unchanged_rounds": transition.unchanged_rounds},
                     })
                     break
@@ -1491,14 +1496,41 @@ async def _code_wiki_evidence_stream(request: CodeAgentRequest) -> StreamingResp
                 active_scope = refresh_request_scope(active_scope)
                 if project_id not in active_scope.allowed_project_ids:
                     raise PermissionError("代码项目授权已在回答前撤销")
-                if not investigation_evidence_sufficient or not citations.items:
+                if not citations.items:
                     answer_text = "当前代码调查没有形成足够的可定位证据，无法可靠回答该问题。"
                 else:
-                    messages.append({"role": "system", "content": f"调查阶段已经结束，原因是 {loop_state.stop_reason or 'agent_completed'}。现在仅根据已有证据生成最终回答，不得继续调用工具，并明确未确认部分。"})
+                    messages.append({"role": "system", "content": (
+                        f"调查阶段已经结束，原因是 {loop_state.stop_reason or 'agent_completed'}。"
+                        "现在仅根据已经返回的工具证据生成完整最终回答，不得继续调用工具。"
+                        "先给出明确结论，再按‘证据位置’、‘实现流程’、‘关键组件/函数’、"
+                        "‘证据等级’和‘尚未确认的边界’组织内容。"
+                        "不要因为某个信息缺口就丢弃已经确认的事实；可以使用 Markdown，"
+                        "如果证据支持调用关系，可以增加 Mermaid 流程图代码块。"
+                    )})
+                    # 调查阶段的每次工具结果都保留在对话中供 Agent 继续决策，
+                    # 但最终回答不需要重复携带完整原始载荷。过大的完整历史会让
+                    # 最终模型请求超过上下文限制，表现为“调查完成但统一 Agent 失败”。
+                    final_messages = []
+                    final_chars = 0
+                    for index, item in enumerate(messages):
+                        compact_item = dict(item)
+                        content = str(compact_item.get("content") or "")
+                        if item.get("role") == "tool" and len(content) > 5000:
+                            content = content[:5000] + "\n[工具结果已压缩，保留前部证据]"
+                        elif len(content) > 8000:
+                            content = content[:8000] + "\n[历史消息已压缩]"
+                        compact_item["content"] = content
+                        final_messages.append(compact_item)
+                        final_chars += len(content)
+                    # 保持最后追加的回答约束，同时限制最终请求的总文本规模。
+                    if final_chars > 70000:
+                        compact_messages = final_messages[:2]
+                        compact_messages.extend(final_messages[-12:])
+                        final_messages = compact_messages
                     final_holder = {}
                     answer_auth_checked_at = perf_counter()
                     async for event in stream_model_call(
-                        "code_agent_final", "代码 Agent · 最终回答", "answer", messages, None, final_holder,
+                        "code_agent_final", "代码 Agent · 最终回答", "answer", final_messages, None, final_holder,
                     ):
                         active_scope, answer_auth_checked_at = await refresh_answer_authorization(
                             active_scope,
@@ -1520,7 +1552,7 @@ async def _code_wiki_evidence_stream(request: CodeAgentRequest) -> StreamingResp
                 "project": project,
                 "answer": answer_text,
                 "answer_html": render_answer_markdown(answer_text),
-                "sources": citations.items if investigation_evidence_sufficient else [],
+                "sources": citations.items,
                 "evidence_payloads": evidence_payloads if request.evidence_only else [],
                 "observability": {"round_limit": max_rounds, "completed_rounds": loop_state.completed_rounds, "tool_call_limit": max_tool_calls, "tool_calls": loop_state.tool_calls, "citations": len(citations.items), "evidence_sufficient": investigation_evidence_sufficient, "stop_reason": loop_state.stop_reason, "unchanged_rounds": loop_state.unchanged_rounds, "total_ms": total_ms},
             })
@@ -2271,11 +2303,16 @@ async def agentic_knowledge_stream(
                     source_actions.clear()
                 # 一次空查询不等于路径耗尽；每类能力允许模型改变查询再补证一次。
                 remaining_paths = {action for action in source_actions if state.action_attempt_count(action) < 2}
-                allowed_actions = set(remaining_paths) | {"replan"}
+                # 只有仍存在未尝试的知识能力时才允许 replan。
+                # 如果所有路径都已尝试，继续 replan 只会让模型重复提交
+                # answer/replan，而不会产生任何新证据。
+                allowed_actions = set(remaining_paths)
                 if state.evidence:
                     allowed_actions.add("answer")
                 if not remaining_paths:
                     allowed_actions.add("refuse")
+                else:
+                    allowed_actions.add("replan")
 
                 try:
                     decision = await asyncio.to_thread(
@@ -2341,8 +2378,11 @@ async def agentic_knowledge_stream(
                     if state.can_answer(decision):
                         state.apply_decision(decision)
                         break
-                    state.replan("answer_gate_rejected", ["回答引用未覆盖当前有效证据"])
-                    continue
+                    if remaining_paths:
+                        state.replan("answer_gate_rejected", ["回答引用未覆盖当前有效证据"])
+                        continue
+                    state.mark_refused("answer_gate_rejected")
+                    break
                 if decision.next_action == "refuse":
                     if remaining_paths:
                         state.replan("refuse_gate_rejected", ["仍有合法且未尝试的知识能力"])
@@ -2350,6 +2390,9 @@ async def agentic_knowledge_stream(
                     state.apply_decision(decision)
                     break
                 if decision.next_action == "replan":
+                    if not remaining_paths:
+                        state.mark_refused("replan_without_remaining_capability")
+                        break
                     state.replan(decision.reason or "model_requested_replan", list(decision.missing_information))
                     continue
                 if state.scope_mode == "strict_project" and decision.next_action == "retrieve_rag":
@@ -2423,7 +2466,8 @@ async def agentic_knowledge_stream(
                     raise RuntimeError("Code Wiki evidence adapter returned no result")
                 observability = code_done.get("observability", {})
                 state.record_child_tool_calls(int(observability.get("tool_calls", 0) or 0))
-                state.record_child_rounds(int(observability.get("completed_rounds", 0) or 0))
+                # 子 Agent 的调查轮次属于内部子任务，不推进顶层 Knowledge Agent
+                # 的决策轮次；否则一次代码调查会让顶层 UI 从第 2 轮跳到第 20 轮。
                 commit = str(code_done.get("project", {}).get("commit") or "")
                 state.commit_id = commit or state.commit_id
                 source_by_id = {str(item.get("id")): item for item in code_done.get("sources", []) if item.get("id")}
@@ -2699,8 +2743,10 @@ async def hybrid_knowledge_stream(message: str, project_id: str, scope: AccessSc
             code_evidence_sufficient = code_done.get("observability", {}).get("evidence_sufficient")
             code_tool_calls = int(code_done.get("observability", {}).get("tool_calls", 0) or 0)
             state.record_child_tool_calls(code_tool_calls)
-            state.record_child_rounds(int(code_done.get("observability", {}).get("completed_rounds", 0) or 0))
-            if code_commit and code_sources and code_evidence_sufficient is True:
+            # Hybrid 同样保持父子轮次隔离，子 Agent 轮次只保留在 code_done 指标中。
+            # 子 Agent 可能因“无新证据”自然停止，但已有源码引用仍然是有效的部分证据。
+            # 是否足以回答交给顶层 Answer Gate，不应因为未显式调用 finish 就丢弃。
+            if code_commit and code_sources:
                 state.commit_id = str(code_commit)
                 code_evidence = tuple(
                     KnowledgeEvidence(
@@ -2714,7 +2760,7 @@ async def hybrid_knowledge_stream(message: str, project_id: str, scope: AccessSc
                 )
                 state.record_tool_result(KnowledgeToolResult(
                     tool_call_id=f"codewiki-{state.used_tool_calls}", capability="query_codewiki",
-                    status="success", result={"summary": code_summary, "commit": code_commit},
+                    status="success" if code_evidence_sufficient is True else "partial",
                     evidence=code_evidence,
                     usage={"tool_calls": code_tool_calls},
                     provenance={"source_system": "code_wiki", "commit": code_commit},

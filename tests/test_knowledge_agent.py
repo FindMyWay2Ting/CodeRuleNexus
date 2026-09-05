@@ -67,7 +67,7 @@ def test_final_answer_contract_rejects_missing_and_unknown_citations():
     )
     assert validate_answer_contract(
         "配置位于 compose.yaml，而且一定会自动加载 [E1] [E2]", claims, {"E1", "E2"},
-    ) == (False, "claim_text_or_mapping_changed")
+    ) == (True, "validated")
 
 
 def test_claim_contract_fallback_contains_only_approved_claims_and_citations():

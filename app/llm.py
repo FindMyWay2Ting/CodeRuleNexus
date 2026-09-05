@@ -122,6 +122,8 @@ def decide_next_knowledge_action(
                     "不要假设任何固定工具顺序。用户选择的项目是代码证据的硬边界，但不是整个问题的唯一来源。"
                     "当前项目查询为空只表示本次未命中，不能证明事实不存在；若问题允许文档解释且 RAG 尚未尝试，"
                     "应建议 retrieve_rag。不能建议未列入能力目录或未授权的项目。"
+                    "当 partial 结果中已有可定位、带 Commit 的代码证据足以支持已确认事实时，"
+                    "可以直接 answer，并在 claims 或 missing_information 中说明尚未确认的边界；"
                     "answer 必须提供 supporting_evidence_ids，并将每条 claims 写成"
                     "{text,evidence_ids} 与证据逐条绑定；没有有效证据不得 answer。"
                     "refuse 仅在所有合法补证动作已耗尽时使用，并列出 missing_information。"
@@ -240,7 +242,7 @@ def stream_answer(question: str, context: str, approved_claims: list[dict] | Non
     """流式生成最终回答；Agent 模式可传入已通过 Answer Gate 的 Claim 契约。"""
     claim_contract = json.dumps(approved_claims or [], ensure_ascii=False)
     contract_instruction = (
-        "Claim 契约是最终答案中必须保留的核心事实白名单。"
+        "Claim 契约是最终答案的机器可校验白名单，也是必须保留的核心事实白名单。"
         "先用‘核心结论’列出全部 Claim，Claim 文本必须原样保留，并在对应句子中保留全部 evidence_ids。"
         "核心结论之后可以补充‘证据位置’、‘实现流程’、‘关键组件’、‘调用关系’和‘结论边界’，"
         "但所有新增事实必须来自给定证据，并使用已批准的 evidence_ids。"

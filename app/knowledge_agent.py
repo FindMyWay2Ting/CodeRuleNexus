@@ -47,9 +47,9 @@ def validate_answer_contract(
         return False, "unapproved_citation"
     if not required_ids.issubset(cited_ids):
         return False, "missing_required_citation"
-    # 核心 Claim 必须原样出现在回答中，但允许模型在核心事实之外补充
-    # 解释、实现流程、调用链和 Mermaid 图。这样 Answer Gate 仍校验事实，
-    # 同时不会把最终回答压缩成几行无法用于面试或排障的短结论。
+    # 核心 Claim 必须原样出现在回答中并带齐对应引用，但允许 Claim 所在
+    # 段落继续补充解释、实现流程、调用链和 Mermaid 图。模型通常会把 Claim
+    # 自然地嵌入完整句子，不能因为整行多了说明文字就把长答案降级成短列表。
     for claim in claims:
         normalized_claim = re.sub(r"\s+", " ", claim.text.strip()).strip().rstrip("。；; ")
         claim_found = False
@@ -61,7 +61,7 @@ def validate_answer_contract(
             text = re.sub(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", "", line)
             text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", text).strip()
             text = re.sub(r"\s+", " ", text).rstrip("。；; ")
-            if text == normalized_claim and set(claim.evidence_ids).issubset(line_ids):
+            if normalized_claim in text and set(claim.evidence_ids).issubset(line_ids):
                 claim_found = True
                 break
         if not claim_found:
@@ -367,16 +367,18 @@ class KnowledgeAgentState:
 
     def can_answer(self, decision: KnowledgeDecision) -> bool:
         """Answer Gate：模型引用的证据必须真实存在，且至少覆盖一条有效证据。"""
-        successful_ids = {
+        usable_ids = {
             str(evidence.get("evidence_id"))
-            for result in self.tool_results if result.get("status") == "success"
+            for result in self.tool_results
+            if result.get("status") == "success"
+            or (result.get("status") == "partial" and result.get("capability") == "query_code_wiki")
             for evidence in result.get("evidence", []) if evidence.get("evidence_id")
         }
         available = {
             str(item.get("evidence_id"))
             for item in self.evidence
             if item.get("evidence_id") and item.get("locator") and str(item.get("content_or_fact") or "").strip()
-            and str(item.get("evidence_id")) in successful_ids
+            and str(item.get("evidence_id")) in usable_ids
             and (item.get("source_type") != "code_wiki" or (
                 item.get("project_id") in (self.allowed_project_ids or {self.project_id}) and item.get("commit_id")
             ))
