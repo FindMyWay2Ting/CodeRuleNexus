@@ -7,11 +7,22 @@ from getpass import getpass
 from http.cookiejar import CookieJar
 import json
 import os
+import re
 import sys
-import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener
+
+
+WORKSPACE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def normalize_workspace_id(value: str) -> str:
+    """接受 UUID 和历史 workspace-* 标识，同时拒绝路径或查询注入字符。"""
+    normalized = value.strip()
+    if not WORKSPACE_ID_PATTERN.fullmatch(normalized):
+        raise ValueError("invalid workspace id")
+    return normalized
 
 
 def request_json(opener, base_url: str, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -58,9 +69,9 @@ def main() -> int:
     if not args.forbidden_workspace_id:
         parser.error("provide --forbidden-workspace-id or KNOWLEDGE_SMOKE_FORBIDDEN_WORKSPACE_ID")
     try:
-        forbidden_workspace_id = str(uuid.UUID(args.forbidden_workspace_id))
+        forbidden_workspace_id = normalize_workspace_id(args.forbidden_workspace_id)
     except ValueError:
-        parser.error("forbidden workspace id must be a valid UUID")
+        parser.error("forbidden workspace id must be a valid service workspace identifier")
     parsed_base = urlparse(args.base_url)
     if parsed_base.scheme not in {"http", "https"} or not parsed_base.hostname:
         parser.error("--base-url must be an absolute HTTP(S) URL")

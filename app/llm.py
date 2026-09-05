@@ -240,8 +240,11 @@ def stream_answer(question: str, context: str, approved_claims: list[dict] | Non
     """流式生成最终回答；Agent 模式可传入已通过 Answer Gate 的 Claim 契约。"""
     claim_contract = json.dumps(approved_claims or [], ensure_ascii=False)
     contract_instruction = (
-        "回答只能表述 Claim 契约中的结论，不得增加、扩展或猜测契约之外的事实。"
-        "每条结论必须保留该 Claim 对应的证据编号；契约为空时按普通证据回答。"
+        "Claim 契约是最终答案的机器可校验白名单。"
+        "必须逐条输出全部 Claim，每个 Claim 独占一行；可以在行首使用短横线，"
+        "但 Claim 文本必须原样保留，不得改写、合并、扩展或添加标题、前言和结语。"
+        "每行末尾必须原样输出该 Claim 的全部 evidence_ids，格式为 [证据编号]，"
+        "不得遗漏、调换到其他 Claim 或引用契约外编号。"
         if approved_claims else ""
     )
     stream = _client(settings.llm_api_base, settings.llm_api_key).chat.completions.create(

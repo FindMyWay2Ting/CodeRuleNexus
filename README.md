@@ -4,7 +4,8 @@
 
 ```powershell
 Copy-Item .env.example .env
-# 修改 .env 中的数据库密码和三个模型服务配置，然后启动 PostgreSQL。
+# 修改 .env 中的数据库密码、三个模型服务配置和代码快照持久化目录，然后启动 PostgreSQL。
+# 需要跨版本目录复用已有 Code Wiki 时，CODE_REPOSITORY_ROOT 必须使用独立绝对路径。
 docker compose up -d postgres
 
 python -m venv .venv
@@ -26,7 +27,19 @@ docker rename knowledge-postgres knowledge-postgres-manual-backup
 docker compose up -d postgres
 ```
 
-Compose 显式复用原来的 `knowledge_pgdata` 卷；确认新服务和旧数据正常后，再自行移除已停止的备份容器。若同名 Compose 容器已经存在，则无需执行这段迁移。
+Compose 显式复用原来的 `knowledge_pgdata` 卷；确认新服务和旧数据正常后，再自行移除已停止的备份容器。旧备份容器与 Compose 服务不能同时启动并挂载这个数据卷。若同名 Compose 容器已经存在，则无需执行这段迁移。
+
+如果数据库中已有 Code Wiki 项目，同时要把代码版本目录移到新的 checkout，先在 `.env` 中把 `CODE_REPOSITORY_ROOT` 设置为 checkout 外的绝对目录。停止 Web 服务后，先预览再执行迁移：
+
+```powershell
+python -m scripts.migrate_code_repository_root --source-root "旧目录\data\code_repositories"
+python -m scripts.migrate_code_repository_root --source-root "旧目录\data\code_repositories" --apply
+python -m scripts.repair_local_code_snapshots
+python -m scripts.repair_local_code_snapshots --apply
+python -m scripts.check_isolation
+```
+
+迁移脚本先复制文件，再在一个数据库事务中切换项目和快照路径，不删除旧目录；修复脚本只重建曾错误继承父 Git 仓库 Commit 的本地上传项目。确认新根目录、Agent 源码读取和 `check_isolation` 均正常后，再人工清理旧目录。
 
 `python -m scripts.check_readiness` 检查配置、数据库扩展、21 张核心表、目标迁移、隔离约束和向量维度；`python -m scripts.check_isolation` 只读核对 Chunk/Document、父子块、代码项目归属、当前快照磁盘/Commit 状态和 Agent 授权项目目录。二者都不会调用模型 API 或输出密钥。服务启动后可使用公开的 `/api/health/live` 检查进程，使用 `/api/health/ready` 检查 PostgreSQL 和目标 schema 是否可用；登录后的 `/api/health` 继续返回当前工作空间状态。
 
@@ -80,17 +93,20 @@ Remove-Item Env:KNOWLEDGE_SMOKE_EMAIL,Env:KNOWLEDGE_SMOKE_PASSWORD,Env:KNOWLEDGE
 - `GET /api/code-wiki/projects/{project_id}/files`：查看当前 Commit 的文件及符号/关系数量
 - `GET /api/code-wiki/symbols?project_id=...&q=...&file_path=...&symbol_kind=...`：按名称、文件和类型搜索符号
 - `GET /api/code-wiki/symbols/{symbol_id}`：查看符号定位、出站关系及入站引用/实现
-- `POST /api/knowledge/stream`：统一 SSE 问答入口，支持 Agentic、RAG 和 Code Wiki 调试模式
+- `POST /api/knowledge/stream`：统一 SSE 问答入口，支持 Agentic、RAG、Code Wiki 和 Hybrid 模式
+- `POST /api/chat|chat/stream|code-wiki/agent/stream`：兼容旧客户端，内部同样委托统一 Agent 和 Answer Gate，不再提供旁路回答器
 
 RAG 上传时标题自动使用文件名，作者和创建者取当前登录身份；版本由系统按同一来源内容变化自动递增，分类和手动版本输入暂不要求。代码项目统一从“代码 Wiki”页面通过 GitHub 或本地目录导入。
 
 Chat 回答支持 Markdown 展示，服务端会先清洗 HTML，再交给页面渲染。
 
+所有公开回答模式共享同一个顶层 Agent。`rag`、`codewiki` 和 `hybrid` 只限制可调用的证据能力；最终回答必须匹配 Answer Gate 批准的 Claim 与引用。模型正文先完整缓存并机械校验，校验失败时仅返回获批 Claim；公开调查事件、每个答案分片和最终 `done` 发送前都会重新验证当前 Session、空间成员、部门和项目 ACL。
+
 当前 MVP 支持个人空间和团队空间。空间角色为 owner、admin、editor、viewer；所有 RAG、Code Wiki 和 Agent 请求都使用服务端 Session 身份解析空间与项目候选集合。每个新账号都会获得独立个人空间；旧 `CURRENT_USER_ID` 数据只有在 `.env` 配置 `LEGACY_BOOTSTRAP_TOKEN` 且注册时提交相同一次性接管码时才会被认领，来源 IP 不是接管凭据。生产部署应关闭自主注册并接企业 IdP。
 
 浏览器 Session Cookie 为 HttpOnly/SameSite，写请求需要 CSRF Cookie 与 Header 匹配。普通用户不能提交服务器绝对路径；项目应通过浏览器文件夹上传。只有明确设置 `ALLOW_SERVER_PATH_SCAN=true` 才会开放旧服务器路径接口。
 
-Code Wiki 的独立页面位于 `http://127.0.0.1:8000/#code-wiki`。页面支持输入公开 GitHub HTTPS 链接，或点击选择本机完整项目文件夹上传，随后展示 SCIP 状态、模块诊断和架构证据，并按“文件 -> 符号 -> 入站/出站关系”逐层查看可追溯代码事实。架构证据分为 Components、Resources 和 Downstream，点击条目可查看文件、行号和原始证据。托管副本统一放在 `data/code_repositories`：GitHub 与本地上传都先在 staging 扫描，再保存为按 Commit/内容哈希命名的不可变快照，并由数据库原子切换当前版本；同项目导入和删除由 PostgreSQL advisory lock 串行化。私有仓库认证暂未接入。
+Code Wiki 的独立页面位于 `http://127.0.0.1:8000/#code-wiki`。页面支持输入公开 GitHub HTTPS 链接，或点击选择本机完整项目文件夹上传，随后展示 SCIP 状态、模块诊断和架构证据，并按“文件 -> 符号 -> 入站/出站关系”逐层查看可追溯代码事实。架构证据分为 Components、Resources 和 Downstream，点击条目可查看文件、行号和原始证据。托管副本由 `CODE_REPOSITORY_ROOT` 指定，默认位于 `data/code_repositories`；需要让同一数据库跨 checkout 或滚动版本继续读取既有快照时，应配置 checkout 外的绝对持久化路径。GitHub 与本地上传都先在 staging 扫描，再保存为按 Commit/内容哈希命名的不可变快照，并由数据库原子切换当前版本；同项目导入和删除由 PostgreSQL advisory lock 串行化。私有仓库认证暂未接入。
 
 Code Wiki 使用 Tree-sitter 解析 Python/Go 的结构，并以 SCIP 作为精确语义增强层。扫描 Go module 时会自动执行 `scip-go`、解析官方 Protobuf 索引，将定义、引用和实现关系合并进 `code_symbols/code_relations`；Python 通过临时 `sourcegraph/scip-python:v0.6.6` 容器生成索引，容器不可用时回退 Tree-sitter。模块级结果和索引哈希保存在 `code_projects.scan_metadata`。当前 Go SCIP 仍运行在宿主机，因此演示环境只应导入可信仓库；面向不可信代码开放前必须迁移到隔离 Worker 或受限容器。
 

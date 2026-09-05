@@ -83,7 +83,18 @@ IGNORED_DIRS = {
 }
 
 ID_NAMESPACE = uuid.UUID("2c6b3b0d-0d8b-4a68-b5e5-b0a2f0f48f7e")
-DEFAULT_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent / "data" / "code_repositories"
+
+
+def resolve_repository_root(configured_path: str | None = None) -> Path:
+    """解析持久化代码快照目录；相对路径固定以项目根目录为基准。"""
+    project_root = Path(__file__).resolve().parent.parent
+    repository_root = Path(configured_path or settings.code_repository_root).expanduser()
+    if not repository_root.is_absolute():
+        repository_root = project_root / repository_root
+    return repository_root.resolve()
+
+
+DEFAULT_REPOSITORY_ROOT = resolve_repository_root()
 
 # Wiki 事实层保留可用于架构理解和导航的定义；局部变量仍可作为引用 target_ref，
 # 但不单独生成数据库符号，避免大型项目被参数和临时变量淹没。
@@ -225,14 +236,19 @@ def _yaml_scalar_entries(text: str) -> list[tuple[str, str, int, str]]:
 
 
 def _git_commit(root: Path) -> tuple[str, str]:
-    """优先记录 Git HEAD；非 Git 目录使用文件哈希生成可复现扫描版本。"""
+    """仅把独立 Git 仓库的 HEAD 当版本；嵌套普通目录必须走内容哈希。"""
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5, check=True,
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, check=True,
         )
-        commit = result.stdout.strip()
-        if commit:
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        git_root = Path(lines[0]).expanduser().resolve() if len(lines) >= 2 else None
+        commit = lines[1] if len(lines) >= 2 else ""
+        # `git -C child rev-parse HEAD` 会向父目录寻找 .git。浏览器上传的 staging
+        # 位于本项目目录内，若不校验顶层目录就会误用宿主项目的 Commit。
+        if git_root == root.resolve() and commit:
             return commit, "git"
     except (OSError, subprocess.SubprocessError):
         pass
@@ -297,12 +313,20 @@ def managed_local_repository_path(project_name: str, repository_root: Path | Non
     return root / f"{slug}-{digest}"
 
 
-def managed_code_project_id(identity_path: Path, workspace_id: str) -> str:
-    """由稳定托管身份生成项目 ID；随机 staging 和 Commit 目录都不参与。"""
-    identity = str(identity_path.resolve())
-    if workspace_id != settings.workspace_id:
-        identity = f"{workspace_id}:{identity}"
+def managed_code_project_id(repository_key: str, workspace_id: str) -> str:
+    """由工作空间和规范仓库键生成 ID，不让磁盘部署路径改变项目身份。"""
+    identity = f"{workspace_id}:{repository_key.strip().casefold()}"
     return str(uuid.uuid5(ID_NAMESPACE, identity))
+
+
+def existing_managed_project_id(workspace_id: str, repository_key: str) -> str | None:
+    """迁移或换数据根后优先复用已登记项目，保持 ACL 和页面链接稳定。"""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT project_id FROM code_projects WHERE workspace_id = %s AND repository_key = %s",
+            (workspace_id, repository_key),
+        ).fetchone()
+    return str(row[0]) if row else None
 
 
 def _remove_managed_tree(path: Path) -> None:
@@ -1883,9 +1907,15 @@ def persist_scan(scan: dict) -> dict:
     }
 
 
+def repository_lock_resource(repository_key: str | None, project_id: str) -> str:
+    """返回项目生命周期锁键；稳定仓库键优先，旧数据才退回项目 ID。"""
+    normalized_key = (repository_key or "").strip().casefold()
+    return f"repository:{normalized_key}" if normalized_key else f"project:{project_id}"
+
+
 @contextmanager
 def repository_import_lock(workspace_id: str, resource_key: str):
-    """使用 PostgreSQL session advisory lock 串行化同一代码项目的导入。"""
+    """使用 PostgreSQL session advisory lock 串行化同一代码项目的导入、修复和删除。"""
     lock_key = int.from_bytes(
         hashlib.sha256(f"code-import:{workspace_id}:{resource_key.casefold()}".encode("utf-8")).digest()[:8],
         byteorder="big",
@@ -1919,10 +1949,11 @@ def import_and_scan_github_repository(
     managed_root.mkdir(parents=True, exist_ok=True)
     # GitHub 仓库身份大小写无关，避免 URL 大小写变体绕过项目锁和幂等 ID。
     repository_key = github_repository_key(owner, repository)
-    stable_identity_path = managed_root / repository_key
-    project_id = managed_code_project_id(stable_identity_path, workspace_id)
+    project_id = existing_managed_project_id(workspace_id, repository_key) or managed_code_project_id(
+        repository_key, workspace_id,
+    )
 
-    with repository_import_lock(workspace_id, f"project:{project_id}"):
+    with repository_import_lock(workspace_id, repository_lock_resource(repository_key, project_id)):
         with connection() as conn:
             existed = conn.execute(
                 "SELECT 1 FROM code_projects WHERE project_id = %s AND workspace_id = %s",
@@ -2016,8 +2047,19 @@ def delete_code_projects(
     workspace_id = workspace_id or settings.workspace_id
     user_id = user_id or settings.current_user_id
     for project_id in unique_ids:
-        # 删除与导入竞争同一把项目锁，避免旧目录清理误删刚完成的新快照。
-        with repository_import_lock(workspace_id, f"project:{project_id}"):
+        # 先读取稳定仓库身份，再与导入竞争完全相同的锁。锁内仍会重新读取和鉴权，
+        # 因此预读取到加锁之间发生的更新或删除不会被当成最终事实。
+        with connection() as conn:
+            identity_row = conn.execute(
+                """SELECT repository_key FROM code_projects
+                   WHERE project_id = %s AND workspace_id = %s""",
+                (project_id, workspace_id),
+            ).fetchone()
+        if not identity_row:
+            missing.append(project_id)
+            continue
+        lock_resource = repository_lock_resource(identity_row[0], project_id)
+        with repository_import_lock(workspace_id, lock_resource):
             repository_paths: list[Path] = []
             with connection() as conn:
                 row = conn.execute(

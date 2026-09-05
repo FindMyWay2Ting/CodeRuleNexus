@@ -36,7 +36,14 @@ from .auth import (
 )
 from .agent_loop import AgentLoopState
 from .adaptive_retrieval import AdaptiveRetrievalState
-from .knowledge_agent import KnowledgeAgentState, KnowledgeDecision, KnowledgeEvidence, KnowledgeToolResult
+from .knowledge_agent import (
+    KnowledgeAgentState,
+    KnowledgeDecision,
+    KnowledgeEvidence,
+    KnowledgeToolResult,
+    render_claim_contract_answer,
+    validate_answer_contract,
+)
 from .code_agent import (
     CODE_AGENT_TOOLS,
     CitationRegistry,
@@ -63,10 +70,12 @@ from .code_wiki import (
     list_code_projects,
     managed_local_repository_path,
     managed_code_project_id,
+    existing_managed_project_id,
     normalize_uploaded_path,
     persist_scan,
     read_code_source,
     repository_import_lock,
+    repository_lock_resource,
     scan_project,
     search_code_symbols,
     trace_code_call_chain,
@@ -690,6 +699,29 @@ def refresh_scope_for_cached_rag(previous: AccessScope) -> AccessScope:
     return current
 
 
+async def refresh_answer_authorization(
+    previous: AccessScope,
+    last_checked: float,
+    *,
+    required_project_ids: set[str] | None = None,
+    require_same_department: bool = False,
+    force: bool = False,
+) -> tuple[AccessScope, float]:
+    """答案流期间定期续租授权，避免撤权后继续发送后续 Token。"""
+    now = perf_counter()
+    if not force and now - last_checked < 0.5:
+        return previous, last_checked
+    current = await asyncio.to_thread(refresh_request_scope, previous)
+    if current.user_id != previous.user_id or current.workspace_id != previous.workspace_id:
+        raise PermissionError("请求身份或工作空间已变化")
+    if require_same_department and current.department_id != previous.department_id:
+        raise PermissionError("用户部门已变化，请重新发起查询")
+    required = required_project_ids or set()
+    if not required.issubset(set(current.allowed_project_ids)):
+        raise PermissionError("代码项目授权已在回答期间撤销")
+    return current, now
+
+
 def require_workspace_write(scope: AccessScope) -> None:
     """上传、扫描和共享知识变更只允许 editor 及以上角色。"""
     try:
@@ -969,8 +1001,13 @@ async def import_local_code_project(files: list[UploadFile] = File(...), workspa
             project_name, DEFAULT_REPOSITORY_ROOT, scope.workspace_id,
         )
         identity_path.parent.mkdir(parents=True, exist_ok=True)
-        project_id = managed_code_project_id(identity_path, scope.workspace_id)
-        with repository_import_lock(scope.workspace_id, f"project:{project_id}"):
+        repository_key = f"local:{identity_path.name.casefold()}"
+        project_id = existing_managed_project_id(scope.workspace_id, repository_key) or managed_code_project_id(
+            repository_key, scope.workspace_id,
+        )
+        with repository_import_lock(
+            scope.workspace_id, repository_lock_resource(repository_key, project_id),
+        ):
             # 先在 staging 完成扫描，项目的当前版本在 persist_scan 提交前保持不变。
             scan = await asyncio.to_thread(scan_project, str(staging_project), scope.workspace_id)
             commit_hash = str(scan["commit_hash"])
@@ -1003,7 +1040,7 @@ async def import_local_code_project(files: list[UploadFile] = File(...), workspa
                 "type": "local_upload",
                 "project_name": project_name,
                 "uploaded_files": saved_files,
-                "repository_key": f"local:{identity_path.name.casefold()}",
+                "repository_key": repository_key,
             }
             try:
                 result = await asyncio.to_thread(persist_scan, scan)
@@ -1183,9 +1220,8 @@ def code_symbol_call_chain(
     return result
 
 
-@app.post("/api/code-wiki/agent/stream")
-async def code_wiki_agent_stream(request: CodeAgentRequest) -> StreamingResponse:
-    """运行单项目 Wiki Agent，并推送公开分析、工具调用与最终证据。"""
+async def _code_wiki_evidence_stream(request: CodeAgentRequest) -> StreamingResponse:
+    """内部 Code Wiki 取证器；公共回答必须再经过顶层 Answer Gate。"""
     if not request.message.strip():
         raise HTTPException(400, "message is required")
     project_id = parse_document_id(request.project_id)
@@ -1455,13 +1491,28 @@ async def code_wiki_agent_stream(request: CodeAgentRequest) -> StreamingResponse
                 active_scope = refresh_request_scope(active_scope)
                 if project_id not in active_scope.allowed_project_ids:
                     raise PermissionError("代码项目授权已在回答前撤销")
-                messages.append({"role": "system", "content": f"调查阶段已经结束，原因是 {loop_state.stop_reason or 'agent_completed'}。现在仅根据已有证据生成最终回答，不得继续调用工具，并明确未确认部分。"})
-                final_holder = {}
-                async for event in stream_model_call(
-                    "code_agent_final", "代码 Agent · 最终回答", "answer", messages, None, final_holder,
-                ):
-                    yield event
-                answer_text = final_holder["message"].content or "证据不足，无法生成代码结论。"
+                if not investigation_evidence_sufficient or not citations.items:
+                    answer_text = "当前代码调查没有形成足够的可定位证据，无法可靠回答该问题。"
+                else:
+                    messages.append({"role": "system", "content": f"调查阶段已经结束，原因是 {loop_state.stop_reason or 'agent_completed'}。现在仅根据已有证据生成最终回答，不得继续调用工具，并明确未确认部分。"})
+                    final_holder = {}
+                    answer_auth_checked_at = perf_counter()
+                    async for event in stream_model_call(
+                        "code_agent_final", "代码 Agent · 最终回答", "answer", messages, None, final_holder,
+                    ):
+                        active_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                            active_scope,
+                            answer_auth_checked_at,
+                            required_project_ids={project_id},
+                        )
+                        yield event
+                    active_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                        active_scope,
+                        answer_auth_checked_at,
+                        required_project_ids={project_id},
+                        force=True,
+                    )
+                    answer_text = final_holder["message"].content or "证据不足，无法生成代码结论。"
 
             total_ms = round((perf_counter() - started_at) * 1000, 2)
             yield _sse_event("done", {
@@ -1469,7 +1520,7 @@ async def code_wiki_agent_stream(request: CodeAgentRequest) -> StreamingResponse
                 "project": project,
                 "answer": answer_text,
                 "answer_html": render_answer_markdown(answer_text),
-                "sources": citations.items,
+                "sources": citations.items if investigation_evidence_sufficient else [],
                 "evidence_payloads": evidence_payloads if request.evidence_only else [],
                 "observability": {"round_limit": max_rounds, "completed_rounds": loop_state.completed_rounds, "tool_call_limit": max_tool_calls, "tool_calls": loop_state.tool_calls, "citations": len(citations.items), "evidence_sufficient": investigation_evidence_sufficient, "stop_reason": loop_state.stop_reason, "unchanged_rounds": loop_state.unchanged_rounds, "total_ms": total_ms},
             })
@@ -1511,9 +1562,8 @@ def route_question(message: str) -> str:
     return "hybrid"
 
 
-@app.post("/api/chat")
-def chat(request: ChatRequest) -> dict:
-    """执行问题路由、向量检索、证据拼接和带引用的模型回答。"""
+def _legacy_chat(request: ChatRequest) -> dict:
+    """保留旧实现用于回归对照；它不再注册为公共回答接口。"""
     if not request.message.strip():
         raise HTTPException(400, "message is required")
     scope = request_scope(request.workspace_id)
@@ -1644,9 +1694,8 @@ def chat(request: ChatRequest) -> dict:
     return {"route": route, "retrieval_mode": retrieval_mode, "context_tokens": telemetry["context_tokens"], "answer": response, "answer_html": render_answer_markdown(response), "sources": sources, "observability": telemetry}
 
 
-@app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
-    """通过 SSE 实时发送可验证的处理步骤，最后发送完整答案和证据。"""
+async def _legacy_chat_stream(request: ChatRequest) -> StreamingResponse:
+    """保留旧实现用于回归对照；它不再注册为公共回答接口。"""
     if not request.message.strip():
         raise HTTPException(400, "message is required")
     scope = request_scope(request.workspace_id)
@@ -1969,16 +2018,28 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             stage_started = perf_counter()
             response_parts: list[str] = []
             chat_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            answer_auth_checked_at = perf_counter()
             stream = stream_answer(request.message, evidence)
             while True:
                 item = await asyncio.to_thread(_next_stream_item, stream)
                 if item is None:
                     break
+                active_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                    active_scope,
+                    answer_auth_checked_at,
+                    require_same_department=True,
+                )
                 if item["type"] == "delta":
                     response_parts.append(item["content"])
                     yield _sse_event("model", {"id": "rag_answer", "role": "回答模型", "phase": "answer", "status": "streaming", "delta": item["content"]})
                 elif item["type"] == "usage":
                     chat_usage = item
+            active_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                active_scope,
+                answer_auth_checked_at,
+                require_same_department=True,
+                force=True,
+            )
             response_text = "".join(response_parts) or "无法生成回答。"
             yield _sse_event("model", {"id": "rag_answer", "role": "回答模型", "phase": "answer", "status": "completed"})
             telemetry["chat_input_tokens"] = chat_usage.get("prompt_tokens", 0)
@@ -2114,8 +2175,16 @@ def _split_code_payloads_by_citation(payloads: list[dict]) -> dict[str, list[str
     return mapped
 
 
-async def agentic_knowledge_stream(message: str, project_id: str | None, scope: AccessScope | None = None) -> StreamingResponse:
-    """运行唯一顶层动态循环；每轮由模型建议动作，代码执行范围与结束门禁。"""
+async def agentic_knowledge_stream(
+    message: str,
+    project_id: str | None,
+    scope: AccessScope | None = None,
+    capability_mode: str = "auto",
+) -> StreamingResponse:
+    """运行唯一顶层动态循环；显式模式只限制能力，不绕过统一 Answer Gate。"""
+    if capability_mode not in {"auto", "rag", "codewiki", "hybrid"}:
+        raise ValueError("unsupported knowledge capability mode")
+
     async def event_generator():
         resolved_scope = scope or request_scope()
         state = KnowledgeAgentState(
@@ -2123,10 +2192,46 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
             allowed_project_ids=set(resolved_scope.allowed_project_ids),
             authorized_projects=list(resolved_scope.authorized_projects),
         )
+        if capability_mode == "codewiki":
+            state.set_scope("strict_project", "none")
         sources: list[dict] = []
-        available_routes: set = {"rag"}
-        if project_id or resolved_scope.allowed_project_ids:
+        available_routes: set = (
+            {"rag"} if capability_mode == "rag" else
+            {"wiki"} if capability_mode == "codewiki" else
+            {"hybrid"} if capability_mode == "hybrid" else
+            {"rag"}
+        )
+        if capability_mode == "auto" and (project_id or resolved_scope.allowed_project_ids):
             available_routes.update({"wiki", "hybrid"})
+        investigated_project_ids: set[str] = set()
+
+        async def checkpoint_investigation_authorization(
+            additional_project_ids: set[str] | None = None,
+        ) -> None:
+            """公开调查事件发送前复核当前证据仍属于有效授权范围。"""
+            nonlocal resolved_scope
+            evidence_project_ids = {
+                str(item.get("project_id"))
+                for item in state.evidence
+                if item.get("source_type") == "code_wiki" and item.get("project_id")
+            }
+            evidence_project_ids.update(investigated_project_ids)
+            evidence_project_ids.update(additional_project_ids or set())
+            has_rag_evidence = any(item.get("source_type") == "rag" for item in state.evidence)
+            resolved_scope, _ = await refresh_answer_authorization(
+                resolved_scope,
+                0.0,
+                required_project_ids=evidence_project_ids,
+                require_same_department=has_rag_evidence,
+                force=True,
+            )
+            state.allowed_project_ids.intersection_update(resolved_scope.allowed_project_ids)
+            state.authorized_projects = [
+                item for item in resolved_scope.authorized_projects
+                if item.get("project_id") in state.allowed_project_ids
+            ]
+            if project_id and project_id not in state.allowed_project_ids:
+                raise PermissionError("selected project authorization revoked during investigation")
         try:
             while not state.answer_ready and not state.refused:
                 # Agent 可能运行数十秒，每轮重新查询会话、空间成员和项目 ACL，
@@ -2146,14 +2251,19 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                 if project_id and project_id not in state.allowed_project_ids:
                     state.mark_refused("authorization_revoked_during_request")
                     break
+                # 旧证据进入下一轮 Planner Prompt 之前必须再次校验其项目/部门授权；
+                # 不能只在 Planner 返回后拦截浏览器事件，否则外部模型已看见旧证据。
+                await checkpoint_investigation_authorization()
                 state.begin_round()
                 if state.refused:
                     break
 
-                source_actions = {"retrieve_rag"}
-                if project_id or state.allowed_project_ids:
+                source_actions = set()
+                if capability_mode in {"auto", "rag", "hybrid"}:
+                    source_actions.add("retrieve_rag")
+                if capability_mode in {"auto", "codewiki", "hybrid"} and (project_id or state.allowed_project_ids):
                     source_actions.add("query_code_wiki")
-                if state.scope_mode == "strict_project":
+                if state.scope_mode == "strict_project" or capability_mode == "codewiki":
                     source_actions.discard("retrieve_rag")
                 if state.used_tool_calls >= state.max_tool_calls:
                     source_actions.clear()
@@ -2191,14 +2301,41 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                         target_project_id=deterministic_code_target if fallback_action == "query_code_wiki" else None,
                     )
                 state.apply_scope_suggestion(decision)
+                if capability_mode == "codewiki":
+                    state.set_scope("strict_project", "none")
+                elif capability_mode == "hybrid":
+                    # 显式 Hybrid 的产品契约要求两侧证据；模型可以调整查询，
+                    # 但不能通过 strict_project 建议关闭文档检索能力。
+                    state.set_scope("soft_project", "rag_allowed")
+                decision_target_project_id = decision.target_project_id or project_id
+                if decision.next_action == "query_code_wiki":
+                    if decision_target_project_id not in state.allowed_project_ids:
+                        state.replan(
+                            "project_not_in_authorized_candidate_set",
+                            ["只能查询当前空间内已授权的代码项目"],
+                        )
+                        continue
+                    investigated_project_ids.add(str(decision_target_project_id))
                 update = decision.public_update or decision.reason or f"下一步执行 {decision.next_action}"
                 for event in _public_agent_trace(
                     f"knowledge_round_{state.used_rounds}",
                     f"Knowledge Agent · 第 {state.used_rounds} 轮", update,
                 ):
+                    await checkpoint_investigation_authorization(
+                        {str(decision_target_project_id)}
+                        if decision.next_action == "query_code_wiki" and decision_target_project_id else None
+                    )
                     yield event
 
                 if decision.next_action == "answer":
+                    if capability_mode == "hybrid":
+                        successful_capabilities = {
+                            str(result.get("capability"))
+                            for result in state.tool_results if result.get("status") == "success"
+                        }
+                        if not {"retrieve_rag", "query_code_wiki"}.issubset(successful_capabilities):
+                            state.replan("hybrid_evidence_incomplete", ["需要同时获得文档和代码证据"])
+                            continue
                     if state.can_answer(decision):
                         state.apply_decision(decision)
                         break
@@ -2217,10 +2354,7 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                     state.replan("scope_action_mismatch", ["严格项目代码问题不能用文档证据替代代码事实"])
                     continue
 
-                target_project_id = decision.target_project_id or project_id
-                if decision.next_action == "query_code_wiki" and target_project_id not in state.allowed_project_ids:
-                    state.replan("project_not_in_authorized_candidate_set", ["只能查询当前空间内已授权的代码项目"])
-                    continue
+                target_project_id = decision_target_project_id
                 query = decision.queries[0] if decision.queries else message
                 signature = f"{decision.next_action}:{target_project_id or '-'}:{query.strip()[:300]}"
                 try:
@@ -2243,6 +2377,7 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                         result, rag_sources = await _retrieve_rag_capability(query, f"rag-{state.used_tool_calls}", resolved_scope)
                     state.record_tool_result(result)
                     sources.extend(rag_sources)
+                    await checkpoint_investigation_authorization()
                     yield _sse_event("step", {"step": "agentic_rag", "status": "completed", "message": f"文档检索返回 {len(result.evidence)} 条证据", "metrics": result.usage})
                     continue
 
@@ -2253,7 +2388,7 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                 if remaining_tools <= 0 or remaining_rounds <= 0:
                     state.mark_refused("code_agent_budget_unavailable")
                     break
-                response = await code_wiki_agent_stream(CodeAgentRequest(
+                response = await _code_wiki_evidence_stream(CodeAgentRequest(
                     project_id=target_project_id, message=query, evidence_only=True, workspace_id=resolved_scope.workspace_id,
                     max_rounds=remaining_rounds, max_tool_calls=remaining_tools,
                 ))
@@ -2278,6 +2413,9 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                         elif event_name == "error" and data:
                             _raise_child_agent_error(data, "Code Wiki evidence adapter failed")
                         elif event_name in {"step", "model", "analysis"} and data:
+                            # 子 Agent 的 yield 仍只是内存事件；只有顶层重新鉴权后
+                            # 才能把源码路径、符号名和调查摘要发送给浏览器。
+                            await checkpoint_investigation_authorization({str(target_project_id)})
                             yield _sse_event(event_name, data)
                 if not code_done:
                     raise RuntimeError("Code Wiki evidence adapter returned no result")
@@ -2324,6 +2462,9 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                 ])
 
             approved_evidence_ids: set[str] = set()
+            approved_claims = ()
+            approved_code_project_ids: set[str] = set()
+            approved_has_rag = False
             if state.answer_ready:
                 gate_claims = state.approved_claims()
                 gate_evidence_ids = {
@@ -2345,6 +2486,12 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                     and item.get("project_id") not in current_project_ids
                     for item in approved_evidence
                 )
+                approved_code_project_ids = {
+                    str(item.get("project_id"))
+                    for item in approved_evidence
+                    if item.get("source_type") == "code_wiki" and item.get("project_id")
+                }
+                approved_has_rag = any(item.get("source_type") == "rag" for item in approved_evidence)
                 state.allowed_project_ids.intersection_update(current_project_ids)
                 if rag_scope_changed or revoked_code_evidence:
                     state.mark_refused("authorization_changed_before_final_answer")
@@ -2360,6 +2507,7 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                 elif state.answer_ready:
                     yield _sse_event("model", {"id": "knowledge_final", "role": "Knowledge Agent · 最终回答", "phase": "answer", "status": "started"})
                     parts = []
+                    answer_auth_checked_at = perf_counter()
                     stream = stream_answer(message, evidence_text, [
                         {"text": claim.text, "evidence_ids": list(claim.evidence_ids)}
                         for claim in approved_claims
@@ -2368,19 +2516,58 @@ async def agentic_knowledge_stream(message: str, project_id: str | None, scope: 
                         item = await asyncio.to_thread(_next_stream_item, stream)
                         if item is None:
                             break
+                        resolved_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                            resolved_scope,
+                            answer_auth_checked_at,
+                            required_project_ids=approved_code_project_ids,
+                            require_same_department=approved_has_rag,
+                        )
                         if item["type"] == "delta":
                             parts.append(item["content"])
-                            yield _sse_event("model", {"id": "knowledge_final", "role": "Knowledge Agent · 最终回答", "phase": "answer", "status": "streaming", "delta": item["content"]})
-                    answer_text = "".join(parts) or "无法生成回答。"
+                    resolved_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                        resolved_scope,
+                        answer_auth_checked_at,
+                        required_project_ids=approved_code_project_ids,
+                        require_same_department=approved_has_rag,
+                        force=True,
+                    )
+                    generated_answer = "".join(parts) or "无法生成回答。"
+                    contract_valid, contract_reason = validate_answer_contract(
+                        generated_answer,
+                        approved_claims,
+                        approved_evidence_ids,
+                    )
+                    answer_text = generated_answer if contract_valid else render_claim_contract_answer(approved_claims)
+                    state.add_action(
+                        "assess_evidence",
+                        stage="final_answer_contract",
+                        status="validated" if contract_valid else "repaired",
+                        reason=contract_reason,
+                    )
+                    # 完整答案通过引用契约后才对外发送；避免客户端短暂看到未获批内容。
+                    for offset in range(0, len(answer_text), 12):
+                        resolved_scope, answer_auth_checked_at = await refresh_answer_authorization(
+                            resolved_scope,
+                            answer_auth_checked_at,
+                            required_project_ids=approved_code_project_ids,
+                            require_same_department=approved_has_rag,
+                            force=True,
+                        )
+                        yield _sse_event("model", {
+                            "id": "knowledge_final", "role": "Knowledge Agent · 最终回答",
+                            "phase": "answer", "status": "streaming", "delta": answer_text[offset:offset + 12],
+                        })
                     yield _sse_event("model", {"id": "knowledge_final", "role": "Knowledge Agent · 最终回答", "phase": "answer", "status": "completed"})
             else:
                 answer_text = "当前授权范围和已执行能力仍不足以可靠回答该问题。"
                 if state.missing_information:
                     answer_text += "仍缺少：" + "；".join(state.missing_information) + "。"
+            # done 即使是拒答也会携带状态摘要，必须覆盖本次实际调查过的项目。
+            await checkpoint_investigation_authorization(approved_code_project_ids)
             yield _sse_event("done", {
                 "route": "agentic", "answer": answer_text, "answer_html": render_answer_markdown(answer_text),
                 "sources": [source for source in sources if source.get("id") in approved_evidence_ids] if state.answer_ready else [],
-                "observability": {"agent_state": state.snapshot()},
+                "observability": {"agent_state": state.public_snapshot()},
             })
         except PermissionError:
             logger.info("agentic_knowledge_authorization_revoked")
@@ -2463,7 +2650,7 @@ async def hybrid_knowledge_stream(message: str, project_id: str, scope: AccessSc
             if remaining_tool_budget <= 0 or remaining_round_budget <= 0:
                 state.mark_refused("no_child_agent_budget")
                 raise RuntimeError("no budget remains for Code Wiki Agent")
-            code_response = await code_wiki_agent_stream(CodeAgentRequest(
+            code_response = await _code_wiki_evidence_stream(CodeAgentRequest(
                 project_id=project_id, message=message,
                 max_rounds=remaining_round_budget, max_tool_calls=remaining_tool_budget,
                 workspace_id=resolved_scope.workspace_id,
@@ -2600,6 +2787,68 @@ async def hybrid_knowledge_stream(message: str, project_id: str, scope: AccessSc
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 
+async def _collect_knowledge_stream_result(response: StreamingResponse) -> dict:
+    """为旧同步接口消费统一 SSE；只返回通过 Answer Gate 的 done 结果。"""
+    buffer = ""
+    async for raw_chunk in response.body_iterator:
+        buffer += raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else raw_chunk
+        while "\n\n" in buffer:
+            block, buffer = buffer.split("\n\n", 1)
+            event_name = "message"
+            data = None
+            for line in block.splitlines():
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    try:
+                        data = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        data = None
+            if event_name == "done" and isinstance(data, dict):
+                return data
+            if event_name == "error" and isinstance(data, dict):
+                status_code = 403 if data.get("error_code") == "AUTHORIZATION_REVOKED" else 502
+                raise HTTPException(status_code, data.get("message") or "knowledge agent failed")
+    raise HTTPException(502, "knowledge agent returned no approved answer")
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest) -> dict:
+    """兼容旧同步 RAG 客户端，但回答统一经过顶层 Agent 和 Answer Gate。"""
+    if not request.message.strip():
+        raise HTTPException(400, "message is required")
+    scope = request_scope(request.workspace_id)
+    response = await agentic_knowledge_stream(
+        request.message.strip(), None, scope=scope, capability_mode="rag",
+    )
+    return await _collect_knowledge_stream_result(response)
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """兼容旧 SSE RAG 客户端，直接复用统一 Agent 的受控输出。"""
+    if not request.message.strip():
+        raise HTTPException(400, "message is required")
+    scope = request_scope(request.workspace_id)
+    return await agentic_knowledge_stream(
+        request.message.strip(), None, scope=scope, capability_mode="rag",
+    )
+
+
+@app.post("/api/code-wiki/agent/stream")
+async def code_wiki_agent_stream(request: CodeAgentRequest) -> StreamingResponse:
+    """兼容旧客户端，但回答统一交给顶层 Agent 和 Answer Gate。"""
+    if not request.message.strip():
+        raise HTTPException(400, "message is required")
+    project_id = parse_document_id(request.project_id)
+    scope = request_scope(request.workspace_id)
+    if project_id not in scope.allowed_project_ids or not get_code_overview(project_id, scope.workspace_id):
+        raise HTTPException(404, "code project not found in current workspace")
+    return await agentic_knowledge_stream(
+        request.message.strip(), project_id, scope=scope, capability_mode="codewiki",
+    )
+
+
 @app.post("/api/knowledge/stream")
 async def knowledge_stream(request: KnowledgeStreamRequest) -> StreamingResponse:
     """统一知识入口：约束来源后复用 RAG 或 Code Wiki 执行器。"""
@@ -2622,14 +2871,20 @@ async def knowledge_stream(request: KnowledgeStreamRequest) -> StreamingResponse
     if request.mode == "hybrid" and not project_id:
         raise HTTPException(400, "project_id is required for hybrid mode")
     if request.mode == "codewiki":
-        return await code_wiki_agent_stream(CodeAgentRequest(project_id=project_id, message=request.message, workspace_id=scope.workspace_id))
+        return await agentic_knowledge_stream(
+            request.message, project_id, scope=scope, capability_mode="codewiki",
+        )
     if request.mode == "rag":
-        return await chat_stream(ChatRequest(message=request.message, workspace_id=scope.workspace_id))
+        return await agentic_knowledge_stream(
+            request.message, None, scope=scope, capability_mode="rag",
+        )
     if request.mode == "hybrid":
-        return await hybrid_knowledge_stream(request.message, project_id, scope)
+        return await agentic_knowledge_stream(
+            request.message, project_id, scope=scope, capability_mode="hybrid",
+        )
 
     # auto 是唯一顶层动态循环；显式模式保留为单能力调试入口。
-    return await agentic_knowledge_stream(request.message, project_id, scope=scope)
+    return await agentic_knowledge_stream(request.message, project_id, scope=scope, capability_mode="auto")
 
 
 @app.get("/")

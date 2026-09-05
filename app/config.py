@@ -28,6 +28,9 @@ class Settings:
     # Python SCIP 在 Windows 上通过 Linux 容器运行，避免官方 CLI 的路径正则兼容问题。
     scip_python_image: str = os.getenv("SCIP_PYTHON_IMAGE", "sourcegraph/scip-python:v0.6.6")
     scip_python_timeout: int = int(os.getenv("SCIP_PYTHON_TIMEOUT", "300"))
+    # 代码快照属于持久化数据，不应隐式绑定某一次代码 checkout。
+    # 相对路径以项目根目录解析；滚动发布或干净重建时应配置独立的绝对路径。
+    code_repository_root: str = os.getenv("CODE_REPOSITORY_ROOT", "./data/code_repositories")
     workspace_id: str = os.getenv("WORKSPACE_ID", "workspace-001")
     # 当前工作空间显示名称；MVP 阶段默认沿用工作空间 ID，后续可接入工作空间表。
     current_workspace_name: str = os.getenv("CURRENT_WORKSPACE_NAME", "workspace-001")

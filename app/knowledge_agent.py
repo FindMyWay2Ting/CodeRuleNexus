@@ -7,6 +7,7 @@ Wiki 和 Hybrid 都应该通过这个状态记录任务、证据和下一步动�
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
@@ -30,6 +31,53 @@ class ClaimSupport:
 
     text: str
     evidence_ids: tuple[str, ...]
+
+
+def validate_answer_contract(
+    answer_text: str,
+    claims: tuple[ClaimSupport, ...],
+    allowed_evidence_ids: set[str],
+) -> tuple[bool, str]:
+    """机械校验最终答案的引用边界；语义蕴含仍由评测集单独验证。"""
+    if not answer_text.strip() or not claims or not allowed_evidence_ids:
+        return False, "empty_answer_contract"
+    cited_ids = set(re.findall(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", answer_text))
+    required_ids = {evidence_id for claim in claims for evidence_id in claim.evidence_ids}
+    if cited_ids - allowed_evidence_ids:
+        return False, "unapproved_citation"
+    if not required_ids.issubset(cited_ids):
+        return False, "missing_required_citation"
+    remaining_claims = {(claim.text.strip(), frozenset(claim.evidence_ids)) for claim in claims}
+    for raw_line in answer_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line_ids = frozenset(re.findall(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", line))
+        text = re.sub(r"\[([A-Za-z0-9][A-Za-z0-9_-]{0,80})\]", "", line)
+        text = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", text).strip()
+        text = text.rstrip("。；; ")
+        matched = next(
+            (
+                item for item in remaining_claims
+                if text == item[0].rstrip("。；; ") and line_ids == item[1]
+            ),
+            None,
+        )
+        if matched is None:
+            return False, "claim_text_or_mapping_changed"
+        remaining_claims.remove(matched)
+    if remaining_claims:
+        return False, "missing_approved_claim"
+    return True, "validated"
+
+
+def render_claim_contract_answer(claims: tuple[ClaimSupport, ...]) -> str:
+    """模型输出不符合契约时，仅用已批准 Claim 和引用生成保守答案。"""
+    lines = []
+    for claim in claims:
+        citations = " ".join(f"[{evidence_id}]" for evidence_id in claim.evidence_ids)
+        lines.append(f"- {claim.text} {citations}".rstrip())
+    return "\n".join(lines) or "当前证据不足以形成经过验证的回答。"
 
 
 @dataclass(frozen=True)
@@ -469,6 +517,30 @@ class KnowledgeAgentState:
             "tool_results": list(self.tool_results),
             "missing_information": list(self.missing_information),
             "conflicts": list(self.conflicts),
+            "next_action": self.next_action,
+            "answer_ready": self.answer_ready,
+            "refused": self.refused,
+            "stop_reason": self.stop_reason,
+            "decision_count": len(self.decision_history),
+        }
+
+    def public_snapshot(self) -> dict[str, Any]:
+        """返回浏览器可见的运行摘要，不携带证据正文或原始工具载荷。"""
+        return {
+            "request_id": self.request_id,
+            "phase": self.phase,
+            "scope": {"project_id": self.project_id, "commit_id": self.commit_id},
+            "budget": {
+                "max_rounds": self.max_rounds,
+                "max_tool_calls": self.max_tool_calls,
+                "used_rounds": self.used_rounds,
+                "used_tool_calls": self.used_tool_calls,
+            },
+            "route": self.route,
+            "intent": self.intent,
+            "evidence_count": len(self.evidence),
+            "tool_result_count": len(self.tool_results),
+            "missing_information": list(self.missing_information),
             "next_action": self.next_action,
             "answer_ready": self.answer_ready,
             "refused": self.refused,

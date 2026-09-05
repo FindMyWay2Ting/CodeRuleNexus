@@ -87,7 +87,8 @@ def test_final_answer_receives_gate_approved_claim_contract(monkeypatch):
     ))
 
     assert events[0]["content"].endswith("[E1]")
-    assert "不得增加" in request_options["messages"][0]["content"]
+    assert "机器可校验白名单" in request_options["messages"][0]["content"]
+    assert "Claim 文本必须原样保留" in request_options["messages"][0]["content"]
     assert '"evidence_ids": ["E1"]' in request_options["messages"][1]["content"]
 
 

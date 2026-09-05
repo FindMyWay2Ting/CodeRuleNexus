@@ -13,6 +13,7 @@ from fastapi import UploadFile
 
 from app.code_wiki import (
     _architecture_source_symbol,
+    _git_commit,
     _scip_indexer_status,
     github_repository_key,
     managed_local_repository_path,
@@ -20,6 +21,8 @@ from app.code_wiki import (
     normalize_github_url,
     normalize_uploaded_path,
     read_code_inventory_source,
+    repository_lock_resource,
+    resolve_repository_root,
     scan_project,
 )
 from app.code_agent import CitationRegistry, execute_code_agent_tool
@@ -28,11 +31,39 @@ from app.main import import_local_code_project
 
 
 class CodeWikiScannerTests(unittest.TestCase):
+    def test_nested_directory_does_not_inherit_parent_git_commit(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        commit, source = _git_commit(project_root / "tests")
+        self.assertEqual(source, "content_scan")
+        self.assertTrue(commit.startswith("scan-"))
+
+    def test_repository_root_uses_git_commit_only_at_repository_top_level(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        commit, source = _git_commit(project_root)
+        self.assertEqual(source, "git")
+        self.assertEqual(len(commit), 40)
+
+    def test_repository_root_relative_path_is_anchored_to_project(self) -> None:
+        expected = Path(__file__).resolve().parents[1] / "data" / "persistent-code"
+        self.assertEqual(resolve_repository_root("data/persistent-code"), expected.resolve())
+
+    def test_repository_root_accepts_absolute_persistent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(resolve_repository_root(directory), Path(directory).resolve())
+
     def test_github_repository_identity_is_case_insensitive(self) -> None:
         self.assertEqual(
             github_repository_key("OpenAI", "OpenAI-Python"),
             github_repository_key("openai", "openai-python"),
         )
+
+    def test_project_lifecycle_lock_prefers_stable_repository_identity(self) -> None:
+        """导入、修复和删除必须能从同一 repository_key 得到同一把锁。"""
+        self.assertEqual(
+            "repository:example__demo",
+            repository_lock_resource("Example__Demo", "project-1"),
+        )
+        self.assertEqual("project:project-1", repository_lock_resource(None, "project-1"))
     def test_non_git_version_changes_when_only_yaml_changes(self) -> None:
         """配置文件也是 Agent 证据，修改 YAML 必须产生新的内容版本。"""
         with tempfile.TemporaryDirectory() as directory:
